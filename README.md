@@ -1,5 +1,7 @@
 # osu-replay-report
+```
 Vibe coded tool made with Deepseek V4.1 Flash 
+```
 Turn a folder of osu! replays into a readable report about how you actually time
 your taps: how fast you can go before your accuracy drops, whether your two
 inputs stay in step with each other, and where in a stream things fall apart.
