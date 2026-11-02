@@ -100,10 +100,9 @@ for collecting results across players. See `docs/posting-results.md`.
 
 **Snap divisor.** Every note is labelled by how much of a beat it was spaced from
 the previous note — `1/1`, `1/2`, `1/4`, `1/8` — read from the beatmap's own
-timing points. This needs no assumption about the map and no threshold tuned to
-any player, so two people on different maps are still measured on the same scale.
+timing points. 
 
-**Effective BPM.** The note rate expressed the way players talk about it: the BPM
+**Effective BPM.** The BPM
 the map would need for the same note rate as 1/4 notes. A 1/8 stream on a 96 BPM
 map is **192 effective BPM**. Notes per second is effective BPM ÷ 15. This makes
 speeds comparable across maps, mods and snap divisors.
