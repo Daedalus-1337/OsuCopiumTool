@@ -378,38 +378,10 @@ def aggregate(plays, cfg=None):
     out["acc_300_ci"] = ci
     out["acc_reported"] = float(np.mean([p.acc_reported for p in plays]))
     out["acc_model"] = float(np.mean([p.acc_model for p in plays]))
-    out["bias"] = float(err.mean())
+    # ---- timing and precision, from the shared per-play sums
+    out.update(pool_rate_sums([play_rate_sums(p) for p in plays]))
     out["median"] = float(np.median(err))
-    out["late_pct"] = 100 * float((err > 0).mean())
-    out["jitter_sd"] = _sd(err)
     out["w300_median"] = float(np.median(w300))
-    out["off_300_pct"] = 100 * float((~ok).mean())
-    # pooled sd with each play's own bias removed
-    ss = sum(float(((p.err - p.err.mean()) ** 2).sum()) for p in plays)
-    out["jitter_sd_within"] = math.sqrt(ss / len(err)) if len(err) else float("nan")
-    # what centring each play's errors on zero would be worth
-    gain = []
-    for p in plays:
-        if len(p.err) < 20:
-            continue
-        a = 100 * float((np.abs(p.err) <= p.w300).mean())
-        b = 100 * float((np.abs(p.err - np.median(p.err)) <= p.w300).mean())
-        gain.append(b - a)
-    out["bias_correction_gain"] = float(np.mean(gain)) if gain else float("nan")
-
-    # ---- precision contrast: dense (1/4+) against sparse (1/2 and slower)
-    def within_sd(mask_of):
-        ss, nn = 0.0, 0
-        for p in plays:
-            s = mask_of(p)
-            if s.sum() > 1:
-                ss += float(((p.err[s] - p.err[s].mean()) ** 2).sum()); nn += int(s.sum())
-        return math.sqrt(ss / nn) if nn else float("nan"), nn
-    sd_dense, n_dense = within_sd(lambda p: p.divisor >= STREAM_DIVISOR)
-    sd_sparse, n_sparse = within_sd(lambda p: (p.divisor > 0) & (p.divisor <= SPARSE_DIVISOR))
-    out["dense_sd_within"], out["dense_sd_n"] = sd_dense, n_dense
-    out["sparse_sd_within"], out["sparse_sd_n"] = sd_sparse, n_sparse
-    out["degradation"] = (sd_dense / sd_sparse) if sd_sparse else float("nan")
 
     # ---- accuracy by snap divisor
     out["by_divisor"] = []
@@ -433,11 +405,7 @@ def aggregate(plays, cfg=None):
     # reference level, so they say how fast he can go before his accuracy drops
     # relative to how he plays everything else.
     out["by_bpm"], out["by_bpm_stream"] = [], []
-    dbg = _rate(dense, ok)
-    sbg = _rate(sparse, ok)
-    out["dense_rate"], out["dense_rate_ci"], out["dense_n"] = dbg[1], dbg[2], dbg[0]
-    out["sparse_rate"], out["sparse_rate_ci"], out["sparse_n"] = sbg[1], sbg[2], sbg[0]
-    out["speed_plateau"] = sbg[1]
+    out["speed_plateau"] = out["sparse_rate"]
     out["speed_ceiling"] = None
     out["speed_knee"] = None
     out["speed_held_to_baseline"] = None
@@ -574,79 +542,199 @@ def fingerprint(plays, btn, div, gap):
     return res
 
 
-def run_stats(plays, cfg=None):
-    """Everything measured inside stream runs."""
-    out = {}
-    same = nint = 0
-    dev15 = dev50 = nearsim = 0
-    alt_sq_all, com_sq_all, alt_sum, n_alt = 0.0, 0.0, 0.0, 0
-    runs = 0
-    entry_devs, entry_abs = [], []
-    gridvals = []
-    by_len = {"2": [0, 0], "3-5": [0, 0], "6-10": [0, 0], "11+": [0, 0]}
-    offsets = []
-    for p in plays:
-        ids_all = [i for i in range(len(p.err)) if p.run_len[i] > 0]
-        if not ids_all:
+def play_rate_sums(play):
+    """Additive per-play accuracy and precision sums.
+
+    Mirrors `play_run_sums`: everything is a count or a sum, so plays pool by
+    addition and a bootstrap resample is just a different set of sums.
+    """
+    w = play.w300
+    err = play.err
+    ok = np.abs(err) <= w
+    dense = play.divisor >= STREAM_DIVISOR
+    sparse = (play.divisor > 0) & (play.divisor <= SPARSE_DIVISOR)
+    s = {"n": int(len(err)), "n_ok": int(ok.sum()),
+         "sum_e": float(err.sum()), "sum_e2": float((err * err).sum()),
+         "late": int((err > 0).sum()), "off300": int((~ok).sum()),
+         "n_dense": int(dense.sum()), "dense_ok": int((ok & dense).sum()),
+         "n_sparse": int(sparse.sum()), "sparse_ok": int((ok & sparse).sum()),
+         "dense_ss": 0.0, "n_dense_sd": 0, "sparse_ss": 0.0, "n_sparse_sd": 0,
+         "ss_within": 0.0, "gain": 0.0, "gain_n": 0}
+    if s["n"] > 1:
+        s["ss_within"] = float(((err - err.mean()) ** 2).sum())
+    if s["n_dense"] > 1:
+        e = err[dense]
+        s["dense_ss"] = float(((e - e.mean()) ** 2).sum())
+        s["n_dense_sd"] = s["n_dense"]
+    if s["n_sparse"] > 1:
+        e = err[sparse]
+        s["sparse_ss"] = float(((e - e.mean()) ** 2).sum())
+        s["n_sparse_sd"] = s["n_sparse"]
+    if s["n"] >= 20:
+        # what centring this play's errors on zero would be worth, in points
+        s["gain"] = (100 * float((np.abs(err - np.median(err)) <= w).mean())
+                     - 100 * float(ok.mean()))
+        s["gain_n"] = 1
+    return s
+
+
+def pool_rate_sums(sums):
+    """Finalise pooled accuracy and precision sums into the reported values."""
+    if not sums:
+        return {}
+    tot = {}
+    for k in sums[0]:
+        tot[k] = sums[0][k]
+    for s in sums[1:]:
+        for k in tot:
+            tot[k] = tot[k] + s[k]
+
+    def pct(num, den):
+        return 100.0 * num / den if den else float("nan")
+
+    n = tot["n"]
+    out = {
+        "n_taps": n,
+        "acc_300_rate": pct(tot["n_ok"], n),
+        "acc_300_ci": wilson(tot["n_ok"], n),
+        "bias": (tot["sum_e"] / n) if n else float("nan"),
+        "late_pct": pct(tot["late"], n),
+        "off_300_pct": pct(tot["off300"], n),
+        "jitter_sd": (math.sqrt(max(0.0, tot["sum_e2"] / n - (tot["sum_e"] / n) ** 2))
+                      if n else float("nan")),
+        "jitter_sd_within": math.sqrt(tot["ss_within"] / n) if n else float("nan"),
+        "bias_correction_gain": (tot["gain"] / tot["gain_n"]) if tot["gain_n"] else float("nan"),
+        "dense_rate": pct(tot["dense_ok"], tot["n_dense"]),
+        "dense_rate_ci": wilson(tot["dense_ok"], tot["n_dense"]),
+        "dense_n": tot["n_dense"],
+        "sparse_rate": pct(tot["sparse_ok"], tot["n_sparse"]),
+        "sparse_rate_ci": wilson(tot["sparse_ok"], tot["n_sparse"]),
+        "sparse_n": tot["n_sparse"],
+        "dense_sd_within": (math.sqrt(tot["dense_ss"] / tot["n_dense_sd"])
+                            if tot["n_dense_sd"] else float("nan")),
+        "dense_sd_n": tot["n_dense_sd"],
+        "sparse_sd_within": (math.sqrt(tot["sparse_ss"] / tot["n_sparse_sd"])
+                             if tot["n_sparse_sd"] else float("nan")),
+        "sparse_sd_n": tot["n_sparse_sd"],
+    }
+    out["degradation"] = (out["dense_sd_within"] / out["sparse_sd_within"]
+                          if out["sparse_sd_within"] else float("nan"))
+    return out
+
+
+def play_run_sums(play):
+    """Per-play counts and sums for everything measured inside stream runs.
+
+    Every entry is additive, so a set of plays pools by adding its members up.
+    That is what lets the report's pooling and the two-player comparison's
+    bootstrap run off one definition instead of two: `pool_run_sums` finalises
+    these sums into the reported quantities, and resampling plays just produces a
+    different set of sums.
+    """
+    s = {"n_runs": 0, "n_int": 0, "n_dev15": 0, "n_dev50": 0, "n_nearsim": 0,
+         "n_same": 0, "sum_d2": 0.0, "n_alt": 0, "sum_alt": 0.0,
+         "sum_alt2": 0.0, "sum_com2": 0.0, "n_entry": 0, "entry_off15": 0,
+         "entry_off30": 0, "entry_devs": [], "gridvals": [], "offsets": [],
+         "by_len": {"2": [0, 0], "3-5": [0, 0], "6-10": [0, 0], "11+": [0, 0]}}
+    p = play
+    ids_all = [i for i in range(len(p.err)) if p.run_len[i] > 0]
+    if not ids_all:
+        return s
+    for rid in sorted({int(p.run_id[i]) for i in ids_all}):
+        idx = [i for i in ids_all if p.run_id[i] == rid]
+        if len(idx) < 2:
             continue
-        for rid in sorted({int(p.run_id[i]) for i in ids_all}):
-            idx = [i for i in ids_all if p.run_id[i] == rid]
-            if len(idx) < 2:
+        s["n_runs"] += 1
+        bucket = ("2" if len(idx) == 2 else "3-5" if len(idx) <= 5
+                  else "6-10" if len(idx) <= 10 else "11+")
+        for i in idx:
+            s["by_len"][bucket][0] += 1
+            s["by_len"][bucket][1] += int(abs(p.err[i]) <= p.w300)
+        d = np.diff(p.err[idx])
+        g = p.gap[idx][1:]
+        if len(g):
+            s["gridvals"].append(float(np.median(g)))
+        s["n_int"] += len(d)
+        s["sum_d2"] += float((d * d).sum())
+        dev = d / g
+        s["n_dev15"] += int((np.abs(dev) <= 0.15).sum())
+        s["n_dev50"] += int((np.abs(dev) > 0.50).sum())
+        s["n_nearsim"] += int(((g + d) < NEAR_SIM_MS).sum())
+        b = p.button[idx]
+        s["n_same"] += int((b[1:] == b[:-1]).sum())
+        # entry: the first interval of the run
+        f, fg = p.err[idx[1]] - p.err[idx[0]], p.gap[idx[1]]
+        if fg > 0:
+            entry_dev = f / fg
+            s["entry_devs"].append(entry_dev)
+            s["n_entry"] += 1
+            s["entry_off15"] += int(abs(entry_dev) > 0.15)
+            s["entry_off30"] += int(abs(entry_dev) > 0.30)
+        # alternating triples for the phase decomposition
+        for j in range(len(idx) - 2):
+            if b[j] == b[j + 1] or b[j + 1] == b[j + 2]:
                 continue
-            runs += 1
-            bucket = ("2" if len(idx) == 2 else "3-5" if len(idx) <= 5
-                      else "6-10" if len(idx) <= 10 else "11+")
-            for i in idx:
-                by_len[bucket][0] += 1
-                by_len[bucket][1] += int(abs(p.err[i]) <= p.w300)
-            d = np.diff(p.err[idx])
-            g = p.gap[idx][1:]
-            if len(g):
-                gridvals.append(float(np.median(g)))
-            nint += len(d)
-            dev = d / g
-            dev15 += int((np.abs(dev) <= 0.15).sum())
-            dev50 += int((np.abs(dev) > 0.50).sum())
-            nearsim += int(((g + d) < NEAR_SIM_MS).sum())
-            b = p.button[idx]
-            same += int((b[1:] == b[:-1]).sum())
-            # entry: the first interval of the run
-            f, fg = p.err[idx[1]] - p.err[idx[0]], p.gap[idx[1]]
-            if fg > 0:
-                entry_devs.append(f / fg)
-                entry_abs.append(abs(f / fg))
-            # alternating triples for the phase decomposition
-            for j in range(len(idx) - 2):
-                if b[j] == b[j + 1] or b[j + 1] == b[j + 2]:
-                    continue
-                if abs(g[j] - g[j + 1]) > 0.15 * g[j]:
-                    continue
-                a = (d[j] - d[j + 1]) / 2.0
-                c = (d[j] + d[j + 1]) / 2.0
-                alt_sq_all += a * a
-                com_sq_all += c * c
-                alt_sum += a
-                n_alt += 1
-            if len(idx) >= 4 and (b == 1).sum() >= 2 and (b == 2).sum() >= 2:
-                offsets.append(float(np.median(p.err[idx][b == 2])
-                                     - np.median(p.err[idx][b == 1])))
-    out["n_runs"] = runs
-    out["grid_ms"] = float(np.median(gridvals)) if gridvals else float("nan")
+            if abs(g[j] - g[j + 1]) > 0.15 * g[j]:
+                continue
+            a = (d[j] - d[j + 1]) / 2.0
+            c = (d[j] + d[j + 1]) / 2.0
+            s["sum_alt2"] += a * a
+            s["sum_com2"] += c * c
+            s["sum_alt"] += a
+            s["n_alt"] += 1
+        if len(idx) >= 4 and (b == 1).sum() >= 2 and (b == 2).sum() >= 2:
+            s["offsets"].append(float(np.median(p.err[idx][b == 2])
+                                      - np.median(p.err[idx][b == 1])))
+    return s
+
+
+RUN_SUM_KEYS = ("n_runs", "n_int", "n_dev15", "n_dev50", "n_nearsim", "n_same",
+                "sum_d2", "n_alt", "sum_alt", "sum_alt2", "sum_com2", "n_entry",
+                "entry_off15", "entry_off30")
+
+
+def add_run_sums(a, b):
+    """Add two per-play run-sum dicts."""
+    out = {k: a[k] + b[k] for k in RUN_SUM_KEYS}
+    out["entry_devs"] = a["entry_devs"] + b["entry_devs"]
+    out["gridvals"] = a["gridvals"] + b["gridvals"]
+    out["offsets"] = a["offsets"] + b["offsets"]
+    out["by_len"] = {k: [a["by_len"][k][0] + b["by_len"][k][0],
+                         a["by_len"][k][1] + b["by_len"][k][1]]
+                     for k in a["by_len"]}
+    return out
+
+
+def pool_run_sums(sums):
+    """Finalise pooled run sums into the reported quantities."""
+    if not sums:
+        return {}
+    tot = sums[0]
+    for s in sums[1:]:
+        tot = add_run_sums(tot, s)
+    out = {}
+    nint = tot["n_int"]
+    out["n_runs"] = tot["n_runs"]
+    out["grid_ms"] = float(np.median(tot["gridvals"])) if tot["gridvals"] else float("nan")
     out["n_run_intervals"] = nint
-    out["on_grid15"] = 100 * dev15 / nint if nint else float("nan")
-    out["off_grid50"] = 100 * dev50 / nint if nint else float("nan")
-    out["near_sim_pct"] = 100 * nearsim / nint if nint else float("nan")
-    out["alternation_pct"] = 100 * (nint - same) / nint if nint else float("nan")
-    out["entry_off15"] = 100 * float(np.mean([abs(x) > 0.15 for x in entry_devs])) if entry_devs else float("nan")
-    out["entry_off30"] = 100 * float(np.mean([abs(x) > 0.30 for x in entry_devs])) if entry_devs else float("nan")
-    out["entry_median_pct"] = 100 * float(np.median(entry_devs)) if entry_devs else float("nan")
-    out["n_entry"] = len(entry_devs)
-    out["by_run_len"] = [{"bucket": k, "n": v[0], "rate300": (100 * v[1] / v[0]) if v[0] else float("nan")}
-                         for k, v in by_len.items()]
-    if n_alt:
-        ra = math.sqrt(alt_sq_all / n_alt)
-        rc = math.sqrt(com_sq_all / n_alt)
-        am = alt_sum / n_alt
+    out["on_grid15"] = 100 * tot["n_dev15"] / nint if nint else float("nan")
+    out["off_grid50"] = 100 * tot["n_dev50"] / nint if nint else float("nan")
+    out["near_sim_pct"] = 100 * tot["n_nearsim"] / nint if nint else float("nan")
+    out["alternation_pct"] = 100 * (nint - tot["n_same"]) / nint if nint else float("nan")
+    out["interval_rms_ms"] = math.sqrt(tot["sum_d2"] / nint) if nint else float("nan")
+    ed = tot["entry_devs"]
+    out["entry_off15"] = (100 * tot["entry_off15"] / tot["n_entry"]) if tot["n_entry"] else float("nan")
+    out["entry_off30"] = (100 * tot["entry_off30"] / tot["n_entry"]) if tot["n_entry"] else float("nan")
+    out["entry_median_pct"] = 100 * float(np.median(ed)) if ed else float("nan")
+    out["n_entry"] = len(ed)
+    out["by_run_len"] = [{"bucket": k, "n": v[0],
+                          "rate300": (100 * v[1] / v[0]) if v[0] else float("nan")}
+                         for k, v in tot["by_len"].items()]
+    if tot["n_alt"]:
+        n = tot["n_alt"]
+        ra = math.sqrt(tot["sum_alt2"] / n)
+        rc = math.sqrt(tot["sum_com2"] / n)
+        am = tot["sum_alt"] / n
         out["rms_alt"] = ra
         out["rms_com"] = rc
         out["phase_ms"] = math.sqrt(max(0.0, ra * ra - 3 * rc * rc))
@@ -654,11 +742,16 @@ def run_stats(plays, cfg=None):
         out["phase_over_noise"] = out["phase_ms"] / out["noise_ms"] if out["noise_ms"] else float("nan")
         out["hand_offset_systematic_ms"] = am
         out["phase_random_ms"] = math.sqrt(max(0.0, ra * ra - am * am))
-        out["n_alt_pairs"] = n_alt
-    if offsets:
-        out["hand_offset_median_ms"] = float(np.median(offsets))
-        out["n_offset_runs"] = len(offsets)
+        out["n_alt_pairs"] = n
+    if tot["offsets"]:
+        out["hand_offset_median_ms"] = float(np.median(tot["offsets"]))
+        out["n_offset_runs"] = len(tot["offsets"])
     return out
+
+
+def run_stats(plays, cfg=None):
+    """Everything measured inside stream runs, pooled over plays."""
+    return pool_run_sums([play_run_sums(p) for p in plays])
 
 
 # ------------------------------------------------------------------ summary ---

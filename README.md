@@ -162,13 +162,17 @@ python inspect-replays.py REPLAYS [--maps DIR] [--json out.json] [--playstyle-on
 Prints the aggregate tables and can dump everything to JSON. Useful for checking
 that a replay set resolved correctly before sharing anything.
 
-### `tools/` — the research scripts
+### `tools/` — the comparison tool, and the research scripts
 
-The exploratory scripts used to develop the metrics above — significance testing,
-per-spacing curves, hit-error distribution shape, sample selection. They are kept
-because they document how the definitions were arrived at, and because they are
-still useful for pooling several people's reports. They are not part of the
-supported interface and some expect particular file layouts.
+`tools/exp_compare.py` compares two folders of replays on the same definitions the
+report uses, with an interval on the difference between them. See
+`docs/posting-results.md`.
+
+The rest are the exploratory scripts used to develop the metrics above —
+significance testing, per-spacing curves, hit-error distribution shape, sample
+selection. They are kept because they document how the definitions were arrived at.
+They are not part of the supported interface and some expect particular file
+layouts.
 
 ## Sharing results
 
@@ -191,7 +195,8 @@ osu_beatmap.py        .osu beatmap reader, no dependencies
 fetch_map.py          beatmap lookup and download from public mirrors
 batch.py              folder runner used by the research scripts
 docs/                 method, metric definitions, playstyles, limitations, sharing
-tools/                exploratory research scripts
+tools/exp_compare.py  compare two folders of replays on the same definitions
+tools/                the rest of the exploratory research scripts
 examples/             an example report
 ```
 
