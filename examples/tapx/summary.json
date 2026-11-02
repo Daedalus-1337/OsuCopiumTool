@@ -1,0 +1,66 @@
+{
+ "summary": {
+  "n_plays": 50,
+  "n_taps": 30572,
+  "usernames": [
+   "ExamplePlayer"
+  ],
+  "date_first": "2025-09-02",
+  "date_last": "2026-10-31",
+  "star_min": 5.00196,
+  "star_max": 6.85669,
+  "star_median": 5.67939,
+  "map_bpm_min": 85.00000000000006,
+  "map_bpm_max": 270.0000000000003,
+  "acc_300_rate": 95.06083998429936,
+  "acc_reported": 96.94012945194503,
+  "bias": -4.109135810545597,
+  "jitter_sd_within": 17.249700456661255,
+  "bias_correction_gain": 0.7004416948689848,
+  "degradation": 1.608372399036704,
+  "dense_sd_within": 25.399086232411832,
+  "sparse_sd_within": 15.791794392656827,
+  "dense_rate": 87.22277391592188,
+  "sparse_rate": 96.09515447970233,
+  "dense_n": 3021,
+  "sparse_n": 23919,
+  "on_grid15": 49.4195688225539,
+  "off_grid50": 12.570480928689884,
+  "near_sim_pct": 2.8855721393034828,
+  "alternation_pct": 68.02653399668326,
+  "entry_off15": 47.3378509196515,
+  "entry_off30": 25.36302032913843,
+  "phase_ms": 20.475513589670292,
+  "noise_ms": 12.992253950116165,
+  "phase_over_noise": 1.5759785537048572,
+  "hand_offset_median_ms": 0.0,
+  "n_runs": 1033,
+  "n_alt_pairs": 1346,
+  "mods": {
+   "NM": 44,
+   "NF": 6
+  },
+  "playstyle": "alternates on streams only",
+  "inputs": [
+   1,
+   2
+  ],
+  "share_second_input_slow": 0.22994272335799992,
+  "share_second_input_dense": 35.22012578616352,
+  "speed_ceiling_bpm": 100.0,
+  "speed_ceiling_rate300": 95.95645412130638,
+  "speed_ceiling_taps": 643,
+  "speed_knee_bpm": 120.0,
+  "speed_held_to_baseline_bpm": 100.0,
+  "speed_plateau_rate300": 96.09515447970233,
+  "tool": {
+   "name": "osu-replay-report",
+   "version": "1.0",
+   "ceil_300": 90.0,
+   "ceil_min_taps": 100
+  }
+ },
+ "generated": "2026-11-02T00:28:03",
+ "replays_dir": "replays",
+ "skipped": []
+}
