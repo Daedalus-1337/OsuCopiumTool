@@ -2,7 +2,7 @@
 ```
 Vibe coded tool made with Deepseek V4.1 Flash 
 ```
-I wanted a tool so that I could figure out exactly how I was loosing accuracy on streams so I made this
+I wanted a tool so that I could figure out exactly how I was loosing accuracy on streams so I made this.
 
 Turn a folder of osu! replays into a readable report about how you actually time
 your taps: how fast you can go before your accuracy drops, whether your two
