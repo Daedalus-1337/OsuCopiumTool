@@ -1,0 +1,17 @@
+# run artefacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# local caches and downloads (regenerate on first run)
+maps/
+osz/
+report/
+beatmap-metadata.json
+*.osz
+
+# editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

@@ -92,18 +92,23 @@ Key notes, because these are where comparisons go wrong:
 A single-player report describes one person. Comparing two people needs more care
 than putting two reports side by side, because most of the difference you will see
 is general skill rather than anything about style. `tools/exp_compare.py` is the
-tool for that. It takes two sets of replays and reports:
+tool for that. Point it at two folders of replays and it reports:
 
-* accuracy by spacing band and by unbreakable stream-run length, side by side;
-* every headline quantity with a cluster bootstrap over plays, both within each
-  player and on the **difference between** them;
-* the same thing restricted to a subset, for sensitivity checks.
+* both sides' headline quantities, each with a cluster bootstrap over plays and the
+  interval on the **difference between** them, so anything inside sampling noise is
+  labelled as such;
+* each side's playstyle fingerprint, so you can see whether the two were even doing
+  the same thing;
+* accuracy by spacing band and by unbroken stream-run length, side by side.
 
 ```bash
-python batch.py     replay_folder_A maps out/A
-python batch.py     replay_folder_B maps out/B
-python tools/exp_compare.py out/A PlayerA out/B PlayerB out/compare
+python tools/exp_compare.py my_replays/ friend_replays/
+python tools/exp_compare.py my_replays/ friend_replays/ --labels me,them --offline
 ```
+
+Both sides are measured with the same definitions the report uses, so a figure here
+and the same figure in `report.md` are the same figure. `--out compare.md` writes
+the comparison out to post, and `--json compare.json` writes it for collecting.
 
 What makes such a comparison credible, beyond more replays:
 

@@ -1,334 +1,387 @@
-"""Between-group comparison for the tapx stream-accuracy experiment.
+"""Compare two sets of replays on one set of definitions.
 
-    python exp_compare.py <batch_dir_T> <label_T> <batch_dir_K> <label_K> <outdir>
+    python tools/exp_compare.py <replays_A> <replays_B>
+    python tools/exp_compare.py my_replays/ friend_replays/ --labels me,them
 
-Loads two groups using the definitions in exp_metrics.py and reports:
+Point it at two folders of `.osr` files. Both sides are measured with exactly the
+definitions the report uses — `replaymetrics.py` — so a figure here and the same
+figure in `report.py` are the same figure. In particular a *stream* is a note at
+1/4 or denser **by the map's own snap divisor**, not by a fixed millisecond
+threshold, so two players on maps of different tempo stay on one scale.
 
-  * pooled accuracy by absolute spacing band, side by side
-  * accuracy by unbroken stream-run length (separates endurance from the pair)
-  * slow and stream 300-rate, the stream penalty, in-run on-grid share,
-    alternation rate, near-simultaneous share, entry failure, phase_ms, noise_ms
-    and phase/noise, each with a cluster-bootstrap interval within each group
-    and on the difference between groups
-  * the verdict for each decision rule of HYPOTHESIS.md
+Every headline quantity is shown for both sides with the difference between them,
+and each difference carries an interval from a cluster bootstrap that resamples
+*plays*. Taps inside one play share a map, a session and a clock, so they are not
+independent samples; plays are the honest unit. A difference whose interval
+excludes zero is marked SEPARATED, and that is the only kind worth reading as a
+difference at all.
 
-Design note: everything is computed from per-play sufficient statistics (counts
-and sums of squares), so a bootstrap iteration only adds up over plays rather
-than re-scanning taps. Resampling is over plays, which is the correct unit --
-taps inside one play share a clock, a map and a day, and are not independent.
+It also reports each side's playstyle fingerprint, so a reader can see whether the
+two sides were even doing the same thing. What it cannot do is tell you whether a
+difference is about playstyle: with one player per side, player and style are
+completely confounded. A result here is a statement about two people. See
+docs/limitations.md.
+
+Implementation note: the pooling and the bootstrap both run off the per-play
+sufficient statistics in `replaymetrics.py` (`play_rate_sums`, `play_run_sums`),
+and the finalisation goes through that module's own functions rather than
+repeating the arithmetic. That is deliberate — the comparison cannot drift from
+the report, which is what went wrong when it had its own copy of the metrics.
 """
+from __future__ import annotations
+
+import argparse
+import json
 import math
 import sys
+import warnings
 from pathlib import Path
 
-import numpy as np
+warnings.filterwarnings("ignore")
 
-import exp_metrics as em
+# tools/ is a subdirectory: put the repository root on the path so the shared
+# definitions import however this is invoked
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-NBOOT = 4000
-RNG = np.random.default_rng(20261102)
-CUT = 110.0          # slow/stream threshold, ms
-NEAR_SIM = 25.0
-DEF_W300 = 28.4
+import metadata                      # noqa: E402
+import replaymetrics as rm           # noqa: E402
 
-
-def play_suff(taps, w, cutoff=CUT):
-    """Sufficient statistics for one play: counts and sums only."""
-    s = {"n_taps": 0, "n_slow": 0, "ok_slow": 0, "n_stream": 0, "ok_stream": 0,
-         "n_int": 0, "same": 0, "sum_d2": 0.0, "n_dev15": 0, "n_dev50": 0,
-         "n_nearsim": 0, "n_alt": 0, "sum_alt2": 0.0, "sum_com2": 0.0,
-         "n_first": 0, "first_off15": 0, "first_off30": 0, "n_runs": 0,
-         "sum_slow_e": 0.0, "sum_slow_e2": 0.0, "sum_alt": 0.0,
-         "slow_ss_within": 0.0, "n_slow_within": 0,
-         "stream_ss_within": 0.0, "n_stream_within": 0,
-         "band": {em.band_label(lo, hi): np.zeros(3) for lo, hi in em.BANDS},
-         "bucket": {2: np.zeros(2), "3-5": np.zeros(2),
-                    "6-10": np.zeros(2), "11+": np.zeros(2)}}
-    for gap, btn, err in taps:
-        ok = abs(err) <= w
-        s["n_taps"] += 1
-        if gap < cutoff:
-            s["n_stream"] += 1; s["ok_stream"] += int(ok)
-        else:
-            s["n_slow"] += 1; s["ok_slow"] += int(ok)
-            s["sum_slow_e"] += err; s["sum_slow_e2"] += err * err
-        for lo, hi in em.BANDS:
-            if lo <= gap < hi:
-                v = s["band"][em.band_label(lo, hi)]
-                v[0] += 1; v[1] += int(ok); v[2] += int(btn == 2)
-                break
-    slow_e = [e for g, b, e in taps if g >= cutoff]
-    if len(slow_e) > 1:
-        mu = sum(slow_e) / len(slow_e)
-        s["slow_ss_within"] = sum((e - mu) ** 2 for e in slow_e)
-        s["n_slow_within"] = len(slow_e)
-    fast_e = [e for g, b, e in taps if g < cutoff]
-    if len(fast_e) > 1:
-        mu = sum(fast_e) / len(fast_e)
-        s["stream_ss_within"] = sum((e - mu) ** 2 for e in fast_e)
-        s["n_stream_within"] = len(fast_e)
-    for run in em.stream_runs(taps):
-        s["n_runs"] += 1
-        L = len(run)
-        b = 2 if L == 2 else ("3-5" if L <= 5 else ("6-10" if L <= 10 else "11+"))
-        bv = s["bucket"][b]
-        for gap, btn, err in run:
-            bv[0] += 1; bv[1] += int(abs(err) <= w)
-        iv = em.run_intervals(run)
-        if len(iv) > 1 and run[0][1] != run[1][1]:
-            f, fg = run[1][2] - run[0][2], run[1][0]
-            s["n_first"] += 1
-            s["first_off15"] += int(abs(f / fg) > 0.15)
-            s["first_off30"] += int(abs(f / fg) > 0.30)
-        for d, dg, bp, bn in iv:
-            s["n_int"] += 1
-            s["sum_d2"] += d * d
-            if bp == bn:
-                s["same"] += 1
-            dev = abs(d / dg)
-            if dev <= 0.15:
-                s["n_dev15"] += 1
-            if dev > 0.50:
-                s["n_dev50"] += 1
-            if abs(dg + d) < NEAR_SIM:
-                s["n_nearsim"] += 1
-        for d0, d1, g in em.alt_pairs(iv):
-            s["n_alt"] += 1
-            s["sum_alt"] += (d0 - d1) / 2.0
-            s["sum_alt2"] += ((d0 - d1) / 2.0) ** 2
-            s["sum_com2"] += ((d0 + d1) / 2.0) ** 2
-    return s
+DEFAULT_BOOTSTRAP = 400
+RNG_SEED = 20261102
 
 
-def add(a, b):
-    """Sum two sufficient-statistics dicts."""
-    o = dict(a)
-    for k in ("n_taps", "n_slow", "ok_slow", "n_stream", "ok_stream", "n_int",
-              "same", "sum_d2", "n_dev15", "n_dev50", "n_nearsim", "n_alt",
-              "sum_alt2", "sum_com2", "n_first", "first_off15", "first_off30",
-              "n_runs", "sum_slow_e", "sum_slow_e2", "sum_alt",
-              "slow_ss_within", "n_slow_within",
-              "stream_ss_within", "n_stream_within"):
-        o[k] = a[k] + b[k]
-    o["band"] = {k: a["band"][k] + b["band"][k] for k in a["band"]}
-    o["bucket"] = {k: a["bucket"][k] + b["bucket"][k] for k in a["bucket"]}
-    return o
+# -------------------------------------------------------------- bootstrapping ---
+def pool_run_scalars(sel, run_sums):
+    """Pool the numeric parts of the per-play run sums for one resample.
+
+    The list-valued parts (used for medians) are dropped: they cannot be pooled
+    by addition, and the few quantities read off them are reported un-bootstrapped.
+    """
+    tot = {k: 0 for k in rm.RUN_SUM_KEYS}
+    by_len = {k: [0, 0] for k in run_sums[0]["by_len"]}
+    for i in sel:
+        s = run_sums[i]
+        for k in rm.RUN_SUM_KEYS:
+            tot[k] += s[k]
+        for k, v in s["by_len"].items():
+            by_len[k][0] += v[0]
+            by_len[k][1] += v[1]
+    return tot, by_len
 
 
-def zero(s):
-    o = dict(s)
-    for k in o:
-        if k not in ("band", "bucket"):
-            o[k] = 0
-    o["band"] = {k: np.zeros(3) for k in s["band"]}
-    o["bucket"] = {k: np.zeros(2) for k in s["bucket"]}
-    return o
+def finalise_runs(tot, by_len):
+    """Run the shared finalisation over pooled sums, with the lists left empty."""
+    synth = dict(tot)
+    synth["by_len"] = by_len
+    synth["entry_devs"] = []
+    synth["gridvals"] = []
+    synth["offsets"] = []
+    return rm.pool_run_sums([synth])
 
 
-def metrics(s):
-    """Derived quantities from accumulated sufficient statistics."""
-    def pct(num, den):
-        return 100.0 * num / den if den else float("nan")
-    m = {
-        "n_plays": s.get("n_plays", 0), "n_taps": s["n_taps"],
-        "n_slow": s["n_slow"], "n_stream": s["n_stream"], "n_runs": s["n_runs"],
-        "slow_rate": pct(s["ok_slow"], s["n_slow"]),
-        "stream_rate": pct(s["ok_stream"], s["n_stream"]),
-        "on_grid15": pct(s["n_dev15"], s["n_int"]),
-        "off_grid50": pct(s["n_dev50"], s["n_int"]),
-        "near_simult": pct(s["n_nearsim"], s["n_int"]),
-        "alt_rate": pct(s["n_int"] - s["same"], s["n_int"]),
-        "interval_rms": math.sqrt(s["sum_d2"] / s["n_int"]) if s["n_int"] else float("nan"),
-        "entry_off15": pct(s["first_off15"], s["n_first"]),
-        "entry_off30": pct(s["first_off30"], s["n_first"]),
-        "n_first": s["n_first"],
-    }
-    m["stream_penalty"] = m["slow_rate"] - m["stream_rate"]
-    if s["n_slow"]:
-        mu = s["sum_slow_e"] / s["n_slow"]
-        m["slow_sd"] = math.sqrt(max(0.0, s["sum_slow_e2"] / s["n_slow"] - mu * mu))
-        m["slow_bias"] = mu
-    else:
-        m["slow_sd"] = m["slow_bias"] = float("nan")
-    m["slow_sd_within"] = (math.sqrt(s["slow_ss_within"] / s["n_slow_within"])
-                           if s["n_slow_within"] else float("nan"))
-    m["stream_sd_within"] = (math.sqrt(s["stream_ss_within"] / s["n_stream_within"])
-                             if s["n_stream_within"] else float("nan"))
-    # PRIMARY OUTCOME: how much the alternation demand degrades a player's own
-    # tap precision, relative to the same player's slow notes. Dimensionless and
-    # within-player, so it carries no overall skill difference.
-    m["degradation"] = (m["stream_sd_within"] / m["slow_sd_within"]
-                        if m["slow_sd_within"] else float("nan"))
-    if s["n_alt"]:
-        ra = math.sqrt(s["sum_alt2"] / s["n_alt"])
-        rc = math.sqrt(s["sum_com2"] / s["n_alt"])
-        m["rms_alt"] = ra; m["rms_com"] = rc
-        m["phase_pooled"] = math.sqrt(max(0.0, ra * ra - 3 * rc * rc))
-        m["noise_pooled"] = rc * math.sqrt(2)
-        m["phase_over_noise"] = (m["phase_pooled"] / m["noise_pooled"]
-                                 if m["noise_pooled"] else float("nan"))
-        # split the alternating term into a systematic hand offset and its
-        # variation: rms(alt)^2 = mean(alt)^2 + var(alt)
-        am = s["sum_alt"] / s["n_alt"]
-        m["alt_mean"] = am
-        m["alt_sd"] = math.sqrt(max(0.0, s["sum_alt2"] / s["n_alt"] - am * am))
-    else:
-        for k in ("rms_alt", "rms_com", "phase_pooled", "noise_pooled",
-                  "phase_over_noise", "alt_mean", "alt_sd"):
-            m[k] = float("nan")
+def metrics_of(sel, rate_sums, run_sums):
+    """Every bootstrapped quantity for one resample of one side."""
+    rtot = {k: 0 for k in rate_sums[0]}
+    for i in sel:
+        s = rate_sums[i]
+        for k in rtot:
+            rtot[k] += s[k]
+    m = rm.pool_rate_sums([rtot])
+    tot, by_len = pool_run_scalars(sel, run_sums)
+    m.update(finalise_runs(tot, by_len))
+    m["stream_penalty"] = (m["sparse_rate"] - m["dense_rate"]
+                           if m["sparse_rate"] == m["sparse_rate"] else float("nan"))
     return m
 
 
-def load_group(batch_dir):
-    plays, windows = em.load(batch_dir)
-    suff, keep = [], []
-    for pf, taps in sorted(plays.items()):
-        if len(taps) < 30:
-            continue
-        suff.append(play_suff(taps, windows.get(pf) or DEF_W300))
-        keep.append(pf)
-    return keep, suff
+def bootstrap(rate_a, run_a, rate_b, run_b, keys, n_iter, seed=RNG_SEED):
+    """Cluster bootstrap over plays. Returns {key: (ci_a, ci_b, ci_diff)}."""
+    import numpy as np
 
-
-def boot(keepT, sT, keepK, sK, keys):
-    """Cluster bootstrap over plays; returns (T CI, K CI, difference CI) per key."""
-    iT, iK = np.arange(len(sT)), np.arange(len(sK))
-    out = {k: {"T": np.empty(NBOOT), "K": np.empty(NBOOT), "D": np.empty(NBOOT)}
-           for k in keys}
-    baseT = zero(sT[0]); baseK = zero(sK[0])
-    for b in range(NBOOT):
-        aT = baseT.copy(); aK = baseK.copy()
-        for i in RNG.choice(iT, len(iT), True):
-            aT = add(aT, sT[i])
-        for i in RNG.choice(iK, len(iK), True):
-            aK = add(aK, sK[i])
-        mT, mK = metrics(aT), metrics(aK)
+    rng = np.random.default_rng(seed)
+    ia, ib = np.arange(len(rate_a)), np.arange(len(rate_b))
+    vals = {k: {"a": [], "b": [], "d": []} for k in keys}
+    for _ in range(n_iter):
+        ma = metrics_of(rng.choice(ia, len(ia), True), rate_a, run_a)
+        mb = metrics_of(rng.choice(ib, len(ib), True), rate_b, run_b)
         for k in keys:
-            out[k]["T"][b] = mT[k]; out[k]["K"][b] = mK[k]
-            out[k]["D"][b] = mT[k] - mK[k]
-    def q(v, p):
+            va, vb = ma.get(k, float("nan")), mb.get(k, float("nan"))
+            vals[k]["a"].append(va)
+            vals[k]["b"].append(vb)
+            vals[k]["d"].append(va - vb)
+
+    def ci(v):
+        v = np.asarray(v, dtype=float)
         v = v[np.isfinite(v)]
-        return float(np.percentile(v, p)) if v.size else float("nan")
-    return {k: (q(out[k]["T"], 2.5), q(out[k]["T"], 97.5),
-                q(out[k]["K"], 2.5), q(out[k]["K"], 97.5),
-                q(out[k]["D"], 2.5), q(out[k]["D"], 97.5)) for k in keys}
+        if not v.size:
+            return (float("nan"), float("nan"))
+        return (float(np.percentile(v, 2.5)), float(np.percentile(v, 97.5)))
+
+    return {k: (ci(v["a"]), ci(v["b"]), ci(v["d"])) for k, v in vals.items()}
 
 
-def main():
-    dT, lT, dK, lK = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
-    outdir = Path(sys.argv[5]); outdir.mkdir(parents=True, exist_ok=True)
+# ------------------------------------------------------------------ reporting ---
+# key, label, number format, whether a difference in this has a direction worth
+# reading (alternation rate, for instance, is style-dependent and not a score)
+METRICS = [
+    ("n_taps", "taps analysed", "{:,.0f}", False),
+    ("sparse_rate", "300-rate, 1/2 and slower", "{:.1f}", True),
+    ("dense_rate", "300-rate, 1/4 and denser", "{:.1f}", True),
+    ("stream_penalty", "stream penalty, points", "{:+.1f}", True),
+    ("degradation", "precision cost of alternating", "{:.2f}", True),
+    ("dense_sd_within", "spread on 1/4+, ms", "{:.1f}", True),
+    ("sparse_sd_within", "spread on 1/2 and slower, ms", "{:.1f}", True),
+    ("bias", "timing bias, ms (negative = early)", "{:+.1f}", False),
+    ("jitter_sd_within", "scatter, own bias removed, ms", "{:.1f}", True),
+    ("jitter_sd", "scatter, pooled, ms", "{:.1f}", False),
+    ("on_grid15", "in-run intervals on grid", "{:.1f}", True),
+    ("off_grid50", "in-run intervals >50% off", "{:.1f}", True),
+    ("near_sim_pct", "pairs re-pressed (<25 ms)", "{:.1f}", True),
+    ("alternation_pct", "strict alternation (style-dependent)", "{:.1f}", False),
+    ("entry_off15", "first interval >15% out", "{:.1f}", True),
+    ("entry_off30", "first interval >30% out", "{:.1f}", True),
+    ("interval_rms_ms", "interval rms, ms", "{:.1f}", True),
+    ("phase_ms", "hand-to-hand separation, ms", "{:.1f}", True),
+    ("noise_ms", "own jitter floor, ms", "{:.1f}", True),
+    ("phase_over_noise", "separation / jitter", "{:.2f}", True),
+]
 
-    keepT, sT = load_group(dT)
-    keepK, sK = load_group(dK)
-    allT = zero(sT[0])
-    for s in sT:
-        allT = add(allT, s)
-    allK = zero(sK[0])
-    for s in sK:
-        allK = add(allK, s)
-    mT, mK = metrics(allT), metrics(allK)
 
-    print(f"=== {lT} (tapx)  vs  {lK} (keyboard-alt) ===")
-    print(f"  {lT}: {len(sT)} plays, {mT['n_taps']} taps, {mT['n_stream']} stream taps, "
-          f"{mT['n_runs']} stream runs")
-    print(f"  {lK}: {len(sK)} plays, {mK['n_taps']} taps, {mK['n_stream']} stream taps, "
-          f"{mK['n_runs']} stream runs")
-    print()
+def fmt(v, spec):
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return "-"
+    return spec.format(f) if math.isfinite(f) else "-"
 
-    print("ACCURACY BY SPACING BAND (pooled taps, each play's own 300 window)")
-    print(f"  {'band ms':<10}{'T taps':>10}{'T 300':>9}{'K taps':>10}{'K 300':>9}"
-          f"{'input2 T/K':>13}")
-    for lo, hi in em.BANDS:
-        k = em.band_label(lo, hi)
-        nT, oT, iT = allT["band"][k]; nK, oK, iK = allK["band"][k]
-        if nT or nK:
-            fT = f"{100*oT/nT:.1f}%" if nT else "-"
-            fK = f"{100*oK/nK:.1f}%" if nK else "-"
-            sh = f"{100*iT/nT:.0f}/{100*iK/nK:.0f}%" if nT and nK else "-"
-            print(f"  {k:<10}{int(nT):>10}{fT:>9}{int(nK):>10}{fK:>9}{sh:>13}")
-    print()
 
-    print("ACCURACY BY UNBROKEN STREAM-RUN LENGTH (pooled taps inside runs)")
-    print(f"  {'run length':<12}{'T taps':>10}{'T 300':>9}{'K taps':>10}{'K 300':>9}")
-    for b in (2, "3-5", "6-10", "11+"):
-        nT, oT = allT["bucket"][b]; nK, oK = allK["bucket"][b]
-        fT = f"{100*oT/nT:.1f}%" if nT else "-"
-        fK = f"{100*oK/nK:.1f}%" if nK else "-"
-        print(f"  {str(b):<12}{int(nT):>10}{fT:>9}{int(nK):>10}{fK:>9}")
-    print()
+def load_side(folder, maps, osz, songs, meta_cache, offline, quiet):
+    """Analyse one folder of replays, resolving star ratings as needed."""
+    path = Path(folder)
+    if not path.is_dir():
+        sys.exit(f"error: no such folder: {path}")
+    import osr_parse
 
-    keys = [("slow_rate", "slow 300-rate", "{:.1f}"),
-            ("stream_rate", "stream 300-rate", "{:.1f}"),
-            ("stream_penalty", "stream penalty pp", "{:+.1f}"),
-            ("on_grid15", "in-run on-grid %", "{:.1f}"),
-            ("off_grid50", "in-run >50 off %", "{:.1f}"),
-            ("interval_rms", "interval rms ms", "{:.1f}"),
-            ("alt_rate", "alternation %", "{:.1f}"),
-            ("near_simult", "near-simult %", "{:.1f}"),
-            ("entry_off15", "entry >15 off %", "{:.1f}"),
-            ("entry_off30", "entry >30 off %", "{:.1f}"),
-            ("phase_pooled", "phase_ms", "{:.1f}"),
-            ("noise_pooled", "noise_ms", "{:.1f}"),
-            ("phase_over_noise", "phase/noise", "{:.2f}"),
-            ("slow_sd", "slow-note sd (pooled)", "{:.1f}"),
-            ("slow_sd_within", "slow-note sd (within)", "{:.1f}"),
-            ("stream_sd_within", "stream-note sd (within)", "{:.1f}"),
-            ("degradation", "DEGRADATION (stream/slow)", "{:.2f}"),
-            ("slow_bias", "slow-note bias ms", "{:+.1f}"),
-            ("alt_mean", "systematic hand offset", "{:+.1f}"),
-            ("alt_sd", "random phase term ms", "{:.1f}")]
-    cis = boot(keepT, sT, keepK, sK, [k for k, _, _ in keys])
-    print("GROUP VALUES, WITH CLUSTER-BOOTSTRAP INTERVALS (over plays)")
-    print(f"  {'':<18}{'T':>17}{'K':>17}{'difference':>19}")
-    for key, lab, fmt in keys:
-        tlo, thi, klo, khi, dlo, dhi = cis[key]
-        sep = " SEPARATED" if (dlo > 0 or dhi < 0) else ""
-        print(f"  {lab:<18}{fmt.format(mT[key]):>8} [{fmt.format(tlo)},{fmt.format(thi)}]"
-              f"{fmt.format(mK[key]):>9} [{fmt.format(klo)},{fmt.format(khi)}]"
-              f"{fmt.format(mT[key]-mK[key]):>10} [{fmt.format(dlo)},{fmt.format(dhi)}]{sep}")
-    print()
+    md5s = []
+    for f in sorted(path.glob("*.osr")):
+        try:
+            md5s.append(osr_parse.load_header(str(f)).beatmap_hash)
+        except Exception:
+            pass
+    if offline:
+        cache = metadata.load_cache(meta_cache)
+    else:
+        if not quiet:
+            print(f"  resolving metadata for {len(set(md5s))} beatmap(s) "
+                  f"in {path.name}...", flush=True)
+        cache = metadata.enrich(set(md5s), meta_cache)
+    stars = {h: (cache.get(h) or {}).get("difficulty_rating") for h in md5s}
+    stars = {k: v for k, v in stars.items() if isinstance(v, (int, float))}
+    return rm.load_folder(path, maps, osz, songs, stars=stars)
 
-    print("VERDICTS AGAINST THE DECISION RULES OF HYPOTHESIS.md")
-    d1 = cis["stream_penalty"]
-    print(f"  D1  T's stream penalty <= K's                  -> "
-          f"{'MET: A1 refuted' if mT['stream_penalty'] <= mK['stream_penalty'] else 'not met'}"
-          f"   (T {mT['stream_penalty']:+.1f} pp, K {mK['stream_penalty']:+.1f} pp)")
-    d2 = cis["phase_over_noise"]
-    print(f"  D2  T's phase/noise <= K's                     -> "
-          f"{'MET: A3 refuted' if mT['phase_over_noise'] <= mK['phase_over_noise'] else 'not met'}"
-          f"   (T {mT['phase_over_noise']:.2f}, K {mK['phase_over_noise']:.2f};"
-          f" diff [{d2[4]:.2f},{d2[5]:.2f}])")
-    d3 = cis["entry_off30"]
-    print(f"  D3  T's entry >30% off share <= K's            -> "
-          f"{'MET: A4 refuted' if mT['entry_off30'] <= mK['entry_off30'] else 'not met'}"
-          f"   (T {mT['entry_off30']:.1f}%, K {mK['entry_off30']:.1f}%;"
-          f" diff [{d3[4]:.1f},{d3[5]:.1f}])")
-    print(f"  D4  K's own phase/noise >= 0.5                 -> "
-          f"{'MET: attribution to tapx fails' if mK['phase_over_noise'] >= 0.5 else 'not met'}"
-          f"   (K {mK['phase_over_noise']:.2f}, CI [{d2[2]:.2f},{d2[3]:.2f}])")
-    b0, b1 = allT["band"]["160-200"], allT["band"]["70-85"]
-    c0, c1 = allK["band"]["160-200"], allK["band"]["70-85"]
-    fT = (100 * b0[1] / b0[0] if b0[0] else float("nan")) - (100 * b1[1] / b1[0] if b1[0] else float("nan"))
-    fK = (100 * c0[1] / c0[0] if c0[0] else float("nan")) - (100 * c1[1] / c1[0] if c1[0] else float("nan"))
-    print(f"  D5  T's curve falls more slowly than K's       -> "
-          f"{'MET: A5 supported' if fT < fK else 'not met'}   (fall {fT:.1f} pp vs {fK:.1f} pp)")
-    print()
-    print("SUMMARY OF THE ONE SKILL-NORMALISED QUANTITY")
-    print(f"  slow 300-rate      T {mT['slow_rate']:.1f}%   K {mK['slow_rate']:.1f}%   "
-          f"(the matching check)")
-    print(f"  slow-note sd       T {mT['slow_sd']:.1f} ms   K {mK['slow_sd']:.1f} ms   "
-          f"(pooled, includes between-play bias)")
-    print(f"  slow-note sd       T {mT['slow_sd_within']:.1f} ms   K {mK['slow_sd_within']:.1f} ms   "
-          f"(within-play, bias removed)")
-    print(f"  stream-note sd     T {mT['stream_sd_within']:.1f} ms   K {mK['stream_sd_within']:.1f} ms   "
-          f"(within-play)")
-    print(f"  DEGRADATION        T {mT['degradation']:.2f}      K {mK['degradation']:.2f}"
-          f"      (stream sd / slow sd -- primary outcome)")
-    print(f"  interval rms       T {mT['interval_rms']:.1f} ms   K {mK['interval_rms']:.1f} ms")
-    print(f"  phase_ms           T {mT['phase_pooled']:.1f} ms   K {mK['phase_pooled']:.1f} ms")
-    print(f"  noise_ms           T {mT['noise_pooled']:.1f} ms   K {mK['noise_pooled']:.1f} ms")
-    print(f"  phase/noise        T {mT['phase_over_noise']:.2f}   K {mK['phase_over_noise']:.2f}")
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(
+        prog="exp_compare", description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("replays_a", help="folder of .osr replays for the first set")
+    ap.add_argument("replays_b", help="folder of .osr replays for the second set")
+    ap.add_argument("--labels", default=None, metavar="A,B",
+                    help="names for the two sets (default: the player named in the replays)")
+    ap.add_argument("--out", default=None, metavar="FILE",
+                    help="also write the comparison as markdown")
+    ap.add_argument("--json", default=None, metavar="FILE",
+                    help="write the comparison as JSON, for collecting results")
+    ap.add_argument("--maps", default="maps",
+                    help="folder of resolved .osu beatmaps (default: %(default)s)")
+    ap.add_argument("--songs", action="append", default=[], metavar="DIR",
+                    help="osu! Songs folder to resolve beatmaps locally (repeatable)")
+    ap.add_argument("--meta-cache", default=metadata.DEFAULT_CACHE,
+                    help="beatmap metadata cache (default: %(default)s)")
+    ap.add_argument("--offline", action="store_true",
+                    help="never query the mirrors; use caches only")
+    ap.add_argument("--bootstrap", type=int, default=DEFAULT_BOOTSTRAP,
+                    help="resamples per side (default: %(default)s; 0 to skip)")
+    ap.add_argument("--min-taps", type=int, default=200,
+                    help="warn below this many taps on either side (default: %(default)s)")
+    ap.add_argument("--quiet", action="store_true")
+    a = ap.parse_args(argv)
+
+    label_a = label_b = None
+    if a.labels:
+        parts = [p.strip() for p in a.labels.split(",")]
+        if len(parts) != 2:
+            sys.exit("error: --labels takes exactly two names, e.g. --labels me,them")
+        label_a, label_b = parts
+
+    maps = Path(a.maps)
+    osz = maps.parent / "osz"
+    maps.mkdir(parents=True, exist_ok=True)
+
+    sides = []
+    for folder, label in ((a.replays_a, label_a), (a.replays_b, label_b)):
+        plays, skipped = load_side(folder, maps, osz, a.songs, a.meta_cache,
+                                   a.offline, a.quiet)
+        if not plays:
+            reason = f" ({skipped[0][1]})" if skipped else ""
+            sys.exit(f"error: nothing analysable in {folder}{reason}")
+        agg = rm.aggregate(plays)
+        name = label or (agg.get("usernames") or [Path(folder).name])[0]
+        sides.append({"name": name, "folder": str(folder), "agg": agg,
+                      "skipped": skipped, "plays": plays,
+                      "rate_sums": [rm.play_rate_sums(p) for p in plays],
+                      "run_sums": [rm.play_run_sums(p) for p in plays]})
+    A, B = sides
+    for s in sides:
+        s["agg"]["stream_penalty"] = (s["agg"]["sparse_rate"] - s["agg"]["dense_rate"])
+
+    keys = [k for k, _, _, _ in METRICS if k != "n_taps"]
+    cis = {}
+    if a.bootstrap > 0:
+        if not a.quiet:
+            print(f"bootstrapping {a.bootstrap} resamples per side, over plays...",
+                  flush=True)
+        cis = bootstrap(A["rate_sums"], A["run_sums"], B["rate_sums"], B["run_sums"],
+                        keys, a.bootstrap)
+
+    out = []
+    W = out.append
+    W(f"# Replay comparison — {A['name']} vs {B['name']}")
+    W("")
+    W(f"*{A['agg']['n_plays']:,} replay(s) against {B['agg']['n_plays']:,}, "
+      f"{A['agg']['n_taps']:,} taps against {B['agg']['n_taps']:,}. Both sides "
+      f"measured with the definitions in `replaymetrics.py`; a stream is a note at "
+      f"1/4 or denser by the map's own snap divisor.*")
+    W("")
+    for lab, s in (("A", A), ("B", B)):
+        ag, fp = s["agg"], (s["agg"].get("fingerprint") or {})
+        W(f"**{lab} — {s['name']}**  ")
+        W(f"{ag['n_plays']:,} replays · {ag['n_taps']:,} taps · "
+          f"{fmt(ag.get('star_min'), '{:.2f}')}–{fmt(ag.get('star_max'), '{:.2f}')}★ · "
+          f"{fmt(ag.get('played_bpm_min'), '{:.0f}')}–{fmt(ag.get('played_bpm_max'), '{:.0f}')} BPM · "
+          f"mods {', '.join(f'{k}×{v}' for k, v in sorted((ag.get('mods') or {}).items()))}")
+        W(f"playstyle: **{fp.get('verdict', 'unknown')}** — "
+          f"{fmt(fp.get('share_slow'), '{:.0f}')}% of slow notes and "
+          f"{fmt(fp.get('share_dense'), '{:.0f}')}% of stream notes from the second input")
+        if s["skipped"]:
+            W(f"*{len(s['skipped'])} replay(s) skipped, e.g. {s['skipped'][0][1]}*")
+        W("")
+    if A["agg"]["n_taps"] < a.min_taps or B["agg"]["n_taps"] < a.min_taps:
+        W(f"> **Small sample.** One side has fewer than {a.min_taps:,} taps, so most "
+          f"differences below will be sampling noise. Treat this as a first look, not "
+          f"a result.")
+        W("")
+
+    W("## Headline comparison")
+    W("")
+    W("| quantity | A | B | difference | verdict |" if cis
+      else "| quantity | A | B | difference |")
+    W("|:--|--:|--:|--:|:--|" if cis else "|:--|--:|--:|--:|")
+    separated = []
+    for key, label, spec, directional in METRICS:
+        va, vb = A["agg"].get(key), B["agg"].get(key)
+        diff = ((va - vb) if isinstance(va, (int, float)) and isinstance(vb, (int, float))
+                else float("nan"))
+        cells = [label, fmt(va, spec), fmt(vb, spec), fmt(diff, spec)]
+        if cis:
+            lo, hi = cis.get(key, (None, None, (float("nan"), float("nan"))))[2]
+            if math.isfinite(lo) and math.isfinite(hi):
+                sep = (lo > 0 or hi < 0)
+                cells.append("SEPARATED" if sep else "within noise")
+                if sep and directional:
+                    separated.append((label, diff, lo, hi))
+            else:
+                cells.append("-")
+        W("| " + " | ".join(cells) + " |")
+    W("")
+    if cis:
+        W(f"*A row marked SEPARATED has a 95% interval on the difference that excludes "
+          f"zero, from {a.bootstrap} resamples of plays. Everything else is inside "
+          f"sampling noise for this much data.*")
+        W("")
+    if separated:
+        W(f"**{len(separated)} measure(s) separate the two sides:** "
+          + "; ".join(f"{lab} ({fmt(d, '{:+.1f}')}, interval {fmt(lo, '{:+.1f}')} to "
+                      f"{fmt(hi, '{:+.1f}')})" for lab, d, lo, hi in separated) + ".")
+        W("")
+        W("Separated is not the same as *explained by playstyle*. With one player per "
+          "side, player and style cannot be told apart — see `docs/limitations.md`.")
+        W("")
+    else:
+        W("No measure separates the two sides at this sample size.")
+        W("")
+
+    W("## Accuracy by spacing band")
+    W("")
+    W("| band (ms) | A taps | A 300-rate | B taps | B 300-rate | A 2nd input | B 2nd input |")
+    W("|:--|--:|--:|--:|--:|--:|--:|")
+    def band_key(r):
+        return f"{r['lo']:.0f}+" if r["hi"] >= 1e8 else f"{r['lo']:.0f}-{r['hi']:.0f}"
+    ba = {band_key(r): r for r in A["agg"].get("by_spacing", [])}
+    bb = {band_key(r): r for r in B["agg"].get("by_spacing", [])}
+    for k in sorted(set(ba) | set(bb), key=lambda s: float(s.split("-")[0].rstrip("+"))):
+        ra, rb = ba.get(k), bb.get(k)
+        g = lambda r, f: fmt(r.get(f), "{:.1f}") if r else "-"      # noqa: E731
+        n = lambda r: fmt(r.get("n"), "{:,.0f}") if r else "-"      # noqa: E731
+        W(f"| {k} | {n(ra)} | {g(ra, 'rate300')} | {n(rb)} | {g(rb, 'rate300')} | "
+          f"{g(ra, 'second_input_share')} | {g(rb, 'second_input_share')} |")
+    W("")
+
+    W("## Accuracy by unbroken stream-run length")
+    W("")
+    W("| run length | A taps | A 300-rate | B taps | B 300-rate |")
+    W("|:--|--:|--:|--:|--:|")
+    ra_all = {r["bucket"]: r for r in A["agg"].get("by_run_len", [])}
+    rb_all = {r["bucket"]: r for r in B["agg"].get("by_run_len", [])}
+    for k in ("2", "3-5", "6-10", "11+"):
+        ra, rb = ra_all.get(k), rb_all.get(k)
+        g = lambda r, f: fmt(r.get(f), "{:.1f}") if r else "-"      # noqa: E731
+        n = lambda r: fmt(r.get("n"), "{:,.0f}") if r else "-"      # noqa: E731
+        W(f"| {k} notes | {n(ra)} | {g(ra, 'rate300')} | {n(rb)} | {g(rb, 'rate300')} |")
+    W("")
+
+    W("---")
+    W("")
+    W("Definitions: `docs/metrics.md`. What a replay cannot show: "
+      "`docs/limitations.md`. Regenerate with `--bootstrap` for more or fewer "
+      "resamples.")
+    W("")
+
+    text = "\n".join(out)
+    print(text, end="")
+    if a.out:
+        Path(a.out).write_text(text, encoding="utf-8")
+        print(f"\nwrote {a.out}")
+    if a.json:
+        empty = (None, None, None)
+        payload = {
+            "a": {"name": A["name"], "folder": A["folder"],
+                  "n_plays": A["agg"]["n_plays"], "n_taps": A["agg"]["n_taps"],
+                  "playstyle": (A["agg"].get("fingerprint") or {}).get("verdict")},
+            "b": {"name": B["name"], "folder": B["folder"],
+                  "n_plays": B["agg"]["n_plays"], "n_taps": B["agg"]["n_taps"],
+                  "playstyle": (B["agg"].get("fingerprint") or {}).get("verdict")},
+            "bootstrap": a.bootstrap,
+            "metrics": {
+                k: {
+                    "a": A["agg"].get(k), "b": B["agg"].get(k),
+                    "diff": ((A["agg"].get(k) - B["agg"].get(k))
+                             if isinstance(A["agg"].get(k), (int, float))
+                             and isinstance(B["agg"].get(k), (int, float)) else None),
+                    "ci_a": (cis.get(k) or empty)[0] if cis else None,
+                    "ci_b": (cis.get(k) or empty)[1] if cis else None,
+                    "ci_diff": (cis.get(k) or empty)[2] if cis else None,
+                    "separated": (bool((cis.get(k) or (None, None, (float("nan"),) * 2))[2][0] > 0
+                                       or (cis.get(k) or (None, None, (float("nan"),) * 2))[2][1] < 0)
+                                  if cis else None),
+                } for k, _, _, _ in METRICS
+            },
+        }
+        Path(a.json).write_text(json.dumps(payload, indent=1, default=str),
+                                encoding="utf-8")
+        print(f"wrote {a.json}")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
