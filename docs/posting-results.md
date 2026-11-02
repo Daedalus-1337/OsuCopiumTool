@@ -17,7 +17,7 @@ reports that used different settings are never compared as if they matched.
 
 The one file that always works alone is `report.html`.
 
-## Before you post
+
 
 * **Your username is in the report.** Every replay header carries it, and it is
   used as the title.
