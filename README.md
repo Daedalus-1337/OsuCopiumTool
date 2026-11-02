@@ -4,9 +4,7 @@ Turn a folder of osu! replays into a readable report about how you actually time
 your taps: how fast you can go before your accuracy drops, whether your two
 inputs stay in step with each other, and where in a stream things fall apart.
 
-Built for players whose accuracy does not match the rest of their skillset, and
-in particular for players who tap with a pen tip and a keyboard key rather than
-two keys of one hand. Everything it measures is reported for any style, and the
+Everything it measures is reported for any style, and the
 report says which style it thinks you are using and why.
 
 ```
