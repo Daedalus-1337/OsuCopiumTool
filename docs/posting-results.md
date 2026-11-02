@@ -134,4 +134,4 @@ Please include:
 * what you exported and how — top plays, last N plays, a whole folder — because
   that determines what the numbers describe;
 * your playstyle if you know it, and whether the fingerprint in the report agreed.
-  Disagreements are useful data.
+ 
