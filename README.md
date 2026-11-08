@@ -13,18 +13,7 @@ report says which style it thinks you are using and why.
 
 ```
 $ python report.py ~/osu-replays --out my-report
-6 replay file(s) in /home/me/osu-replays
-analysed 6 replay(s), skipped 0
-wrote 4 chart(s)
 
-playstyle: alternates throughout
-300-rate 94.5%   bias -4.1 ms   scatter 11.5 ms
-held 1/4 streams to 170-190 eff. BPM at 92.9% (1847 taps)
-
-wrote my-report/report.md
-wrote my-report/report.html
-wrote my-report/summary.json
-```
 
 `report.html` is one self-contained file with the charts embedded, so it can be
 opened directly or shared as a single attachment.
