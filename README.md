@@ -13,7 +13,7 @@ report says which style it thinks you are using and why.
 
 ```
 $ python report.py ~/osu-replays --out my-report
-
+```
 
 `report.html` is one self-contained file with the charts embedded, so it can be
 opened directly or shared as a single attachment.
