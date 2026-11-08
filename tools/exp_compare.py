@@ -59,6 +59,7 @@ def pool_run_scalars(sel, run_sums):
     """
     tot = {k: 0 for k in rm.RUN_SUM_KEYS}
     by_len = {k: [0, 0] for k in run_sums[0]["by_len"]}
+    by_sp = {k: [] for k in run_sums[0]["by_len_spacing"]}
     for i in sel:
         s = run_sums[i]
         for k in rm.RUN_SUM_KEYS:
@@ -66,13 +67,16 @@ def pool_run_scalars(sel, run_sums):
         for k, v in s["by_len"].items():
             by_len[k][0] += v[0]
             by_len[k][1] += v[1]
-    return tot, by_len
+        for k, v in s["by_len_spacing"].items():
+            by_sp[k].extend(v)
+    return tot, by_len, by_sp
 
 
-def finalise_runs(tot, by_len):
-    """Run the shared finalisation over pooled sums, with the lists left empty."""
+def finalise_runs(tot, by_len, by_sp):
+    """Run the shared finalisation over pooled sums."""
     synth = dict(tot)
     synth["by_len"] = by_len
+    synth["by_len_spacing"] = by_sp
     synth["entry_devs"] = []
     synth["gridvals"] = []
     synth["offsets"] = []
@@ -87,8 +91,8 @@ def metrics_of(sel, rate_sums, run_sums):
         for k in rtot:
             rtot[k] += s[k]
     m = rm.pool_rate_sums([rtot])
-    tot, by_len = pool_run_scalars(sel, run_sums)
-    m.update(finalise_runs(tot, by_len))
+    tot, by_len, by_sp = pool_run_scalars(sel, run_sums)
+    m.update(finalise_runs(tot, by_len, by_sp))
     m["stream_penalty"] = (m["sparse_rate"] - m["dense_rate"]
                            if m["sparse_rate"] == m["sparse_rate"] else float("nan"))
     return m
@@ -329,15 +333,21 @@ def main(argv=None):
 
     W("## Accuracy by unbroken stream-run length")
     W("")
-    W("| run length | A taps | A 300-rate | B taps | B 300-rate |")
-    W("|:--|--:|--:|--:|--:|")
+    W("| run length | A taps | A 300-rate | A spacing | B taps | B 300-rate | B spacing |")
+    W("|:--|--:|--:|--:|--:|--:|--:|")
     ra_all = {r["bucket"]: r for r in A["agg"].get("by_run_len", [])}
     rb_all = {r["bucket"]: r for r in B["agg"].get("by_run_len", [])}
-    for k in ("2", "3-5", "6-10", "11+"):
+    for _, _, k in rm.RUN_LENGTH_BUCKETS:
         ra, rb = ra_all.get(k), rb_all.get(k)
+        na = ra.get("n", 0) if ra else 0
+        nb = rb.get("n", 0) if rb else 0
+        if max(na, nb) < 10:
+            continue
         g = lambda r, f: fmt(r.get(f), "{:.1f}") if r else "-"      # noqa: E731
         n = lambda r: fmt(r.get("n"), "{:,.0f}") if r else "-"      # noqa: E731
-        W(f"| {k} notes | {n(ra)} | {g(ra, 'rate300')} | {n(rb)} | {g(rb, 'rate300')} |")
+        s = lambda r: fmt(r.get("spacing_ms"), "{:.0f} ms") if r else "-"   # noqa: E731
+        W(f"| {k} notes | {n(ra)} | {g(ra, 'rate300')} | {s(ra)} | "
+          f"{n(rb)} | {g(rb, 'rate300')} | {s(rb)} |")
     W("")
 
     W("---")

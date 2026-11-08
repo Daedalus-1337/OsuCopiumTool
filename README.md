@@ -89,7 +89,8 @@ or three. The report warns you when the sample is too small to lean on.
 | **3. Timing** | systematic bias (early/late) against scatter, with your error distribution against the actual 300 window |
 | **4. The two inputs** | each input's own accuracy and bias, and the hand-to-hand timing separation between them |
 | **5. Inside streams** | intervals on the grid, notes effectively dropped, alternation rate, how a run's very first pair behaves, and accuracy by run length |
-| **6. Maps analysed** | every beatmap with star rating, mods, note count, accuracy and a link |
+| **6. Aim, and what it costs** | how many notes were lost to the cursor rather than to the tap, when the cursor arrives, whether a tap landed on a settled or a moving cursor, and accuracy against how far the cursor had to travel |
+| **7. Maps analysed** | every beatmap with star rating, mods, note count, accuracy and a link |
 
 Three figures carry a "what this means" note in the report itself, because they
 are the ones most often misread: the **precision cost of alternating**, the
@@ -197,7 +198,6 @@ batch.py              folder runner used by the research scripts
 docs/                 method, metric definitions, playstyles, limitations, sharing
 tools/exp_compare.py  compare two folders of replays on the same definitions
 tools/                the rest of the exploratory research scripts
-examples/             an example report
 ```
 
 ## What it cannot tell you

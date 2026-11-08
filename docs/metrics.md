@@ -149,17 +149,76 @@ its very first pair. High values mean the beat is never established rather than
 gradually lost: if a run starts wrong and stays at that level, the problem is the
 entry, not the sustain.
 
-**accuracy by run length** — 300-rate on notes inside runs of 2, 3–5, 6–10 and
-11+ notes. A deficit at 2 notes means the problem is in the alternating pair
-itself. A deficit that appears only at 11+ means endurance or drift.
+**accuracy by run length** — 300-rate on notes inside runs of 2, 3–5, 6–10,
+11–20, 21–40, 41–80 and 81+ notes, each bucket carrying its median note spacing.
+A deficit at 2 notes means the problem is in the alternating pair itself; one that
+keeps growing through the longer buckets means endurance or drift.
 
-## Intervals shown in the report
+## Aim
 
-**Wilson intervals** are shown by the research scripts for per-bucket rates. They
-treat taps as independent draws, which they are not: taps inside one play share a
-map, a session and a clock. For comparisons between players the research scripts
-use a cluster bootstrap that resamples *plays* instead, which is the correct unit.
-Treat the per-bucket intervals in a single-player report as indicative.
+Position is read from the replay's own cursor frames and compared with each note's
+own coordinates, both in osu!pixels, so no scaling is involved. A press judges a
+note only when the cursor is inside that note's circle, which gives every note that
+never scored a cause.
+
+**notes accepted** — presses the client acted on.
+
+**lost to aim** — a press fell inside the note's timing window, but the cursor was
+outside the circle, so the press judged nothing and the note went unjudged. The
+press is real; only where it landed was wrong.
+
+**lost with no press** — no press fell near the note at all.
+
+**presses thrown away for position** — every press the client ignored because the
+cursor was over no circle, as a share of all presses. This measures the aim penalty
+in presses rather than in notes.
+
+**note lock** — presses refused because an earlier circle was still unjudged. Such
+a press does nothing whatever its timing.
+
+**arrival** — when the cursor last crossed into the circle before the press, relative
+to the note's time. The search starts at the press where the note was judged and at
+the note's own time where it was not, and walks back while the samples stay inside the
+circle, so an earlier pass through it does not count as an arrival. The crossing itself
+is solved between the last sample outside the circle and the first inside it rather
+than taken as a frame time. Negative is early. `arrived after the note` is the share of
+notes the cursor reached after their own time. Where the cursor had been inside for
+more than a second the entry is earlier than can be measured, and the note is counted
+as unmeasurable instead of being given a clamped value.
+
+**still travelling / cursor settled** — accepted presses split at 0.5 osu!pixels per
+millisecond of cursor movement at the press, taken as a central difference between the
+cursor positions interpolated 8 ms either side of it, each group reported with its
+300-rate and mean absolute error. A flat split means aim is not
+taxing the timing. A deficit in the travelling group means part of what the timing
+tables call tap error is the cost of aiming at the same instant.
+
+**jump** — distance from the previous note's position, bucketed 0–50, 50–100,
+100–200 and 200+ osu!pixels, each with 300-rate and mean absolute error.
+
+**stream separation** — distance from the previous note divided by the circle
+diameter, so 1.0 is where two circles stop overlapping. Reported for notes inside
+streams, in bands from under 0.5 to 2.0 or more diameters, with 300-rate and mean
+error for each. The bands pool across maps of any circle size because the unit is
+the circle, not the pixel. Accuracy holds at the rate of the tightest separation
+played until it drops by 5 points, and the band where that happens is reported as
+the spacing at which accuracy falls away.
+
+**how a stream was played** — a note counts as stream play when its snap divisor is
+1/4 or denser, a neighbouring note is also that dense, and it was struck with a
+different input than the note before it. Those notes are split at one circle
+diameter into stacked and spaced streams. The same spacing played with one input is
+reported separately as single-tapped, stacked or spaced, so a single-tapped run is
+not counted as a stream. Notes at 1/4 without a dense neighbour are isolated fast
+notes, and everything slower is a slow note. Each class carries its pen share and
+its 300-rate on pen taps, so classes played with different hands can still be
+compared.
+
+**no movement required** — notes within 1 osu!pixel of the previous note's position,
+which means a stack or a doubled circle. Reaching them asks nothing of the cursor, so
+they are excluded from arrival, from the travelling/settled split and from the jump
+buckets, and counted separately. They remain in the miss attribution, where the
+position of the press is still what decides the outcome.
 
 ## Thresholds are conventions
 
