@@ -48,10 +48,24 @@ was played, and cannot be resolved. Those replays are skipped and listed.
 Two unknowns have to be resolved before any timing can be measured: which press
 belonged to which note, and how the replay's clock relates to the beatmap's.
 
-**Pairing.** Notes are consumed in order: a press is matched to the oldest note
-that is still inside its 50 window, and a note whose window closes before any
-press is a miss. A press arriving less than 5 ms after the previous one is treated
-as a bounce and discarded, modelling the game's own double-tap filter.
+**Pairing.** A press judges a note when two conditions hold: the press falls inside
+the note's 50 window, and the cursor is inside the note's circle at that instant.
+Among the notes under the cursor the one nearest in time is taken. A press with the
+cursor over no circle judges nothing, and the note it was probably aimed at is
+recorded as lost to aim rather than as a timing miss. The client's note lock is
+applied as well: a press arriving before the start time of an earlier unjudged
+circle is refused. Two presses closer together than 5 ms are treated as one bounce;
+the second finds nothing left inside its window and judges nothing.
+
+Circle radius follows `r = 54.4 − 4.48·CS` in osu!pixels, with HR's circle-size
+multiplier applied. HR also mirrors the playfield vertically, so note positions are
+reflected before any distance is taken; the replay's cursor frames are already in
+that space.
+
+**Excluded replays.** A replay played with relax, autoplay, cinema or autopilot
+carries input the client produced, not the player, so nothing on it measures
+tapping. Those replays are skipped and the reason is reported: relax has the client
+pressing, autopilot has it aiming, autoplay and cinema have it playing the map.
 
 **Hit windows** come from each beatmap's own OD and the play's mods:
 `300 = 80 − 6·OD`, `100 = 140 − 8·OD`, `50 = 200 − 10·OD`, with HR raising OD and
@@ -128,13 +142,22 @@ a report about a different set of replays than you thought.
 
 The pairing model reproduces the recorded judgements closely, but it is a
 *reconstruction calibrated against the game's own counts*, not a reimplementation
-of the client's judgement code. The current client's rules differ in two ways that
-matter for edge cases:
+of the client's judgement code.
 
-- it does not lock notes in order — any unjudged circle may be hit;
-- a press is routed by cursor position, so it must land inside the circle.
+- **Stacking is not modelled.** Where the client draws overlapping circles offset
+  from one another, this reads them at their file coordinates, so a press inside the
+  overlap can be judged against the wrong circle. Dense low-AR patterns are the
+  affected case.
+- **Timing resolution comes from the client's input tick.** The replay stores whole
+  milliseconds, and a press or release forces a frame of its own rather than waiting
+  for the 60 Hz cadence applied to cursor movement, so a press is stamped at the
+  update that processed it. The remaining uncertainty is one update tick, a few
+  milliseconds, plus whatever the input device adds before the client sees it.
+- **A held button can judge a slider head without a fresh press.** That path is not
+  modelled: a press is paired to the note it lands on.
+- **The clock offset is fitted, not known.** It is chosen to reproduce the recorded
+  counts, so the bias figure is reliable while the absolute placement of the taps is
+  not.
 
-Against recorded counts these differences change about 1% of judgements, which is
-why the model reproduces the counts rather than emulating the internals. They do
-matter for any play with heavy mashing or with presses deliberately outside a
-circle, and those plays should be read with more caution.
+Each replay carries its own residual, so plays that the model fits badly can be
+identified rather than averaged in with the rest.

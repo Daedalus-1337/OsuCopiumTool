@@ -57,7 +57,8 @@ def _save(fig):
 
 
 def chart_speed(agg):
-    rows = [r for r in agg.get("by_bpm_stream", []) if r["n"] >= 10]
+    alt = [r for r in agg.get("by_bpm_alt", []) if r["n"] >= 10]
+    rows = alt if len(alt) >= 2 else [r for r in agg.get("by_bpm_stream", []) if r["n"] >= 10]
     if len(rows) < 2:
         return None
     fig, ax = plt.subplots(figsize=FIGSIZE)
@@ -77,7 +78,8 @@ def chart_speed(agg):
     for xi, yi, ni in zip(x, y, n):
         ax.annotate(f"{ni}", (xi, yi), xytext=(0, -13), textcoords="offset points",
                     fontsize=6.5, color=MUTED, ha="center")
-    ax.set_xlabel("effective BPM (1/4 notes or denser)", fontsize=8.5)
+    ax.set_xlabel("effective BPM (alternated 1/4 notes)" if len(alt) >= 2
+                  else "effective BPM (1/4 notes or denser)", fontsize=8.5)
     ax.set_ylabel("300-rate %", fontsize=8.5)
     ax.set_ylim(max(0, min(y) - 8), 102)
     ax.tick_params(labelsize=7.5)
@@ -118,12 +120,13 @@ def chart_runlen(agg):
     fig, ax = plt.subplots(figsize=FIGSIZE)
     xs = [r["bucket"] for r in rows]
     ys = [r["rate300"] for r in rows]
-    ax.bar(range(len(xs)), ys, color=SECOND, alpha=0.85, width=0.6, zorder=2)
+    ax.bar(range(len(xs)), ys, color=SECOND, alpha=0.85, width=0.7, zorder=2)
     for i, (r, y) in enumerate(zip(rows, ys)):
         ax.annotate(f"{r['rate300']:.0f}%\n{nfmt(r['n'])}", (i, y), xytext=(0, 3),
-                    textcoords="offset points", fontsize=7, ha="center", color=INK)
+                    textcoords="offset points", fontsize=6.5, ha="center", color=INK)
     ax.set_xticks(range(len(xs)))
-    ax.set_xticklabels([f"{x} notes" for x in xs], fontsize=8)
+    ax.set_xticklabels(xs, fontsize=8)
+    ax.set_xlabel("notes in the unbroken run", fontsize=8.5)
     ax.set_ylim(0, 108)
     ax.set_ylabel("300-rate %", fontsize=8.5)
     ax.tick_params(labelsize=7.5)
@@ -184,9 +187,12 @@ def headline_rows(agg, cfg=None):
     knee = agg.get("speed_knee")
     speed_txt = "no 1/4-or-denser notes with enough taps"
     if fastest:
+        basis = ("alternated " if agg.get("speed_basis") == "alternated stream taps" else "")
         speed_txt = (f"reaches {_bpm_band(fastest)} at "
                      f"{_num(fastest['rate300'], '{:.1f}')}% "
                      f"({nfmt(fastest['n'])} taps)")
+        if basis:
+            speed_txt = basis + speed_txt
         if ceiling:
             speed_txt += (f"; holds the {cfg.get('ceil_300', 90):.0f}% bar up to "
                           f"{_bpm_band(ceiling)}")
@@ -212,12 +218,6 @@ def headline_rows(agg, cfg=None):
 
 
 # --------------------------------------------------------------- markdown ---
-def _window_ref(agg):
-    """The player's own 300 window, as a sentence fragment for scale."""
-    w = agg.get("w300_median")
-    return f"±{w:.1f} ms" if isinstance(w, float) and w == w else "the hit window"
-
-
 def plain_summary(agg, cfg=None):
     """A short, readable version of the report, in plain language.
 
@@ -248,48 +248,39 @@ def plain_summary(agg, cfg=None):
               "appears when the notes outrun it.")
             A("")
             A(f"*{s_slow:.0f}% of your slow notes come from the second input; "
-              f"{s_dense:.0f}% of your stream notes do.*")
+              f"{s_dense:.0f}% of your notes at 1/4 and denser do.*")
         elif s_slow > 35 and s_dense > 35:
             A("You share the tapping between two inputs at every speed — both of them "
-              "are used on slow notes and on streams alike.")
+              "are used on slow notes and on fast ones alike.")
             A("")
-            A(f"*{s_slow:.0f}% of slow notes and {s_dense:.0f}% of stream notes come "
-              "from the second input.*")
+            A(f"*{s_slow:.0f}% of slow notes and {s_dense:.0f}% of notes at 1/4 and "
+              "denser come from the second input.*")
         else:
             A("You use two inputs, but unevenly, so the pattern is not one of the "
               "common styles.")
             A("")
-            A(f"*{s_slow:.0f}% of slow notes and {s_dense:.0f}% of stream notes come "
-              "from the second input.*")
+            A(f"*{s_slow:.0f}% of slow notes and {s_dense:.0f}% of notes at 1/4 and "
+              "denser come from the second input.*")
     A("")
     if agg.get("dense_n", 0) > 0:
-        A("Three words used below. **Streams** are the fast runs of notes — a quarter "
-          "of a beat apart or denser — the parts that need two inputs. **Spread** is "
-          "how far a tap usually lands from the note; a bigger number means less "
-          f"consistent. The **window** is the timing the game allows, "
-          f"{_window_ref(agg)} here for a 300.")
+        A("**Spread** is how far a tap usually lands from the note; a bigger number "
+          "means less consistent.")
         A("")
-    if n_inputs > 1 and agg.get("alternation_pct") == agg.get("alternation_pct"):
-        alt = agg["alternation_pct"]
-        near = agg.get("near_sim_pct", float("nan"))
-        if alt < 95:
-            A(f"*In your streams, {100 - alt:.0f}% of the time two notes in a row come "
-              "from the same input instead of alternating.*")
-            if near == near and near < 5:
-                A("")
-                A(f"*Most of that is not a mistimed pair: only {near:.0f}% of your stream "
-                  "intervals are two presses within 25 ms of each other, which is what a "
-                  "dropped note looks like. The rest are deliberate single taps on the "
-                  "slower streams.*")
+    if n_inputs > 1 and agg.get("alt_share_of_fast") == agg.get("alt_share_of_fast"):
+        share = agg["alt_share_of_fast"]
+        if share < 95:
+            A(f"*{100 - share:.0f}% of your notes at 1/4 and denser are single-tapped "
+              "rather than alternated. Those are counted as fast notes, not as streams, "
+              "everywhere below.*")
             A("")
 
     pts = []
     # 1. the precision cost of alternating
     deg = agg.get("degradation")
     if isinstance(deg, float) and deg == deg:
-        dense_sd = agg.get("dense_sd_within", float("nan"))
+        dense_sd = agg.get("alt_sd_within", float("nan"))
         sparse_sd = agg.get("sparse_sd_within", float("nan"))
-        dr = agg.get("dense_rate", float("nan"))
+        dr = agg.get("alt_rate", float("nan"))
         sr = agg.get("sparse_rate", float("nan"))
         show_rates = (dr == dr) and (sr == sr)
         if deg >= 1.15:
@@ -328,17 +319,50 @@ def plain_summary(agg, cfg=None):
         gap15 = (f"by more than {0.15 * grid:.0f} ms" if grid == grid
                  else "by more than a fifth of the gap between notes")
         gap30 = (f"{0.30 * grid:.0f} ms" if grid == grid else "twice that")
+        er = agg.get("run_pos_early_rate")
+        dr = agg.get("run_pos_deep_rate")
+        en = agg.get("run_pos_early_n", 0)
+        dn = agg.get("run_pos_deep_n", 0)
+        deep_known = (er == er and dr == dr and en >= 100 and dn >= 100)
+        worsens = deep_known and dr <= er - 2.0
         if e15 >= 35:
-            line = (f"**Your streams start off the beat, and stay there.** When a stream "
-                    f"begins, the first two notes are usually mistimed: in {e15:.0f}% of "
-                    f"your streams the gap between those two taps is off {gap15}, and in "
-                    f"{e30:.0f}% it is off by {gap30} or more. It does not get worse "
-                    f"further into the stream, so you are not losing the beat partway "
-                    f"through — it is not there to begin with.")
+            head = ("**Your fast runs start off the beat and get worse from there.**"
+                    if worsens else "**Your fast runs start off the beat, and stay there.**")
+            line = (f"{head} When a run begins, the first two notes are usually mistimed: "
+                    f"in {e15:.0f}% of your runs the gap between those two taps is off "
+                    f"{gap15}, and in {e30:.0f}% it is off by {gap30} or more. ")
         else:
-            line = (f"**Your streams mostly start on the beat.** The first two taps are "
-                    f"off {gap15} in {e15:.0f}% of your streams, and off by {gap30} or "
-                    f"more in {e30:.0f}% — the rest begin on time.")
+            line = (f"**Your fast runs mostly start on the beat.** The first two taps are "
+                    f"off {gap15} in {e15:.0f}% of your runs, and off by {gap30} or "
+                    f"more in {e30:.0f}% — the rest begin on time. ")
+
+        if deep_known:
+            if worsens:
+                bands = agg.get("by_run_pos") or []
+                b57 = next((r for r in bands if r["band"] == "5-7"), None)
+                b812 = next((r for r in bands if r["band"] == "8-12"), None)
+                line += (f"Deeper in it dips: {er:.0f}% of the first four notes of a run "
+                         f"score 300")
+                if b57:
+                    line += f" against {b57['rate300']:.0f}% on the fifth to the seventh"
+                if b812 and b812["rate300"] >= er - 1.0:
+                    line += (f", and the eighth to the twelfth is back at "
+                             f"{b812['rate300']:.0f}%, so this is a dip rather than a steady "
+                             f"slide")
+                line += (" — part of the loss is the run going on, not only how it enters.")
+            else:
+                line += (f"Deeper in it does not get worse: {er:.0f}% of the first four "
+                         f"notes of a run score 300 against {dr:.0f}% from the fifth to the "
+                         f"twelfth, so the beat is not there to begin with rather than "
+                         f"being lost partway through.")
+            tail = agg.get("by_run_pos") or []
+            far = next((r for r in tail if r["band"] == "13+"), None)
+            if far and far["n"] < 200:
+                line += (f" Past the twelfth note {far['rate300']:.0f}% score 300, but only "
+                         f"{nfmt(far['n'])} taps get that far, which is too few to lean on.")
+        else:
+            line += ("Whether it degrades deeper into a run cannot be told from this "
+                     "sample: too few taps reach past the fourth note.")
         pts.append(line)
 
     # 3. the two inputs against each other
@@ -349,14 +373,14 @@ def plain_summary(agg, cfg=None):
         if ratio == ratio and ph == ph:
             if ratio >= 1.0:
                 line = (f"**Your two inputs are not in time with each other.** On a "
-                        f"stream they land about {ph:.0f} ms apart, while each one on its "
+                        f"fast run they land about {ph:.0f} ms apart, while each one on its "
                         f"own only strays about {no:.0f} ms from where it usually is. So "
                         f"the two are further apart from each other than either is from "
                         f"itself — it is the switching between them that is loose, not "
                         f"the taps themselves.")
             elif ratio >= 0.6:
                 line = (f"**Your two inputs are close, but not quite locked.** On a "
-                        f"stream they land about {ph:.0f} ms apart, against about "
+                        f"fast run they land about {ph:.0f} ms apart, against about "
                         f"{no:.0f} ms of stray in each one on its own. Near enough to "
                         f"moving as a single unit, but not there.")
             else:
@@ -407,6 +431,27 @@ def plain_summary(agg, cfg=None):
                      f"points. That is arithmetic on your own numbers, not a promise.")
         else:
             line += "."
+        pts.append(line)
+
+    # 6. aim
+    lost = (agg.get("aim_miss_offcircle") or 0) + (agg.get("aim_miss_nopress") or 0)
+    if lost:
+        line = (f"**{nfmt(lost)} notes were lost outright**, {_num(agg.get('aim_miss_pct'), '{:.1f}%')} "
+                f"of every note played. {_num(agg.get('aim_miss_offcircle_pct'), '{:.0f}%')} of those "
+                f"had a press inside the timing window with the cursor off the circle, which the "
+                f"client ignores, and the rest were never pressed at all")
+        if agg.get("presses_locked"):
+            line += (f". Note lock refused {nfmt(agg.get('presses_locked'))} presses, "
+                     f"{_num(agg.get('presses_locked_pct'), '{:.2f}%')} of the total")
+        line += "."
+        mv, st_ = agg.get("moving_rate300"), agg.get("stationary_rate300")
+        if mv == mv and st_ == st_ and agg.get("moving_n", 0) >= 100:
+            if abs(mv - st_) >= 1.0:
+                line += (f" Taps struck while the cursor was still moving scored {mv:.1f}% "
+                         f"against {st_:.1f}% on a settled cursor, so aiming is costing you timing.")
+            else:
+                line += (f" Taps struck while the cursor was still moving scored {mv:.1f}% "
+                         f"against {st_:.1f}% on a settled one, so aiming is not costing you timing.")
         pts.append(line)
 
     if pts:
@@ -471,33 +516,51 @@ def markdown(agg, plays, charts=None, cfg=None):
     # ---- speed
     A("## 2. Speed")
     A("")
-    A("Notes are labelled by how much of a beat they are spaced apart, read from the "
-      "map's own timing points, then converted to an **effective BPM**: the BPM the map "
-      "would need for the same note rate as 1/4 notes. A 1/8 stream on a 96 BPM map is "
-      "192 effective BPM. Notes per second is effective BPM ÷ 15.")
-    A("")
     rows = []
     min_taps = cfg.get("ceil_min_taps", 100)
     for r in agg.get("by_bpm_stream", []):
         mix = ", ".join(f"1/{k}" for k in sorted(r["divisor_mix"]))
         taps = nfmt(r["n"]) + ("" if r["n"] >= min_taps else " (thin)")
         rows.append((f"{r['lo']:.0f}–{r['hi']:.0f}", _nps((r["lo"] + r["hi"]) / 2), mix,
-                     taps, _num(r["rate300"], "{:.1f}%")))
+                     taps, _num(r.get("alt_pct"), "{:.0f}%"),
+                     _num(r["rate300"], "{:.1f}%")))
     if rows:
-        A("**1/4 notes and denser** — the speeds that need two inputs:")
+        A("**1/4 notes and denser** — the speeds that need two inputs. The alternated "
+          "column is the share of those taps where the input changed from the note before:")
         A("")
-        A(table(["eff. BPM", "notes/s", "spacing", "taps", "300-rate"], rows))
-    ceil_txt = (f"no 1/4-or-denser bucket with enough taps reached the "
-                f"{cfg.get('ceil_300', 90):.0f}% bar")
-    if agg.get("speed_ceiling"):
-        c = agg["speed_ceiling"]
-        ceil_txt = (f"**{_bpm_band(c)}** at {c['rate300']:.1f}% on {nfmt(c['n'])} taps")
-    A(f"- **Held to:** {ceil_txt} (bar: {cfg.get('ceil_300', 90):.0f}% 300s, "
-      f"minimum {nfmt(cfg.get('ceil_min_taps', 100))} taps).")
-    if agg.get("speed_fastest"):
-        f_ = agg["speed_fastest"]
+        A(table(["eff. BPM", "notes/s", "spacing", "taps", "alternated", "300-rate"], rows))
+        A("")
+        if agg.get("speed_basis") == "alternated stream taps":
+            A("The held-to figure and the drop point are read from alternated taps only. A "
+              "slow bucket played with one input is single tapping, and counting it as "
+              "stream play would flatter both.")
+            A("")
+    bar = cfg.get("ceil_300", 90)
+    min_n = nfmt(cfg.get("ceil_min_taps", 100))
+    c = agg.get("speed_ceiling")
+    f_ = agg.get("speed_fastest")
+    named = None
+    if c:
+        named = c
+        A(f"- **Reaches the {bar:.0f}% bar at:** **{_bpm_band(c)}** at {c['rate300']:.1f}% "
+          f"on {nfmt(c['n'])} taps (minimum {min_n} taps).")
+    elif f_ and f_["rate300"] >= bar - 0.2:
+        named = f_
+        A(f"- **Just under the {bar:.0f}% bar:** {_bpm_band(f_)} at "
+          f"{f_['rate300']:.2f}% on {nfmt(f_['n'])} taps.")
+    elif f_:
+        named = f_
+        A(f"- **Never reaches the {bar:.0f}% bar:** the best is {_bpm_band(f_)} at "
+          f"{f_['rate300']:.1f}% on {nfmt(f_['n'])} taps.")
+    else:
+        A(f"- **Never reaches the {bar:.0f}% bar:** no bucket with at least {min_n} taps.")
+    if f_ and (named is None or f_["lo"] != named["lo"]):
         A(f"- **Fastest measured:** {_bpm_band(f_)} ({_nps((f_['lo'] + f_['hi']) / 2)} "
           f"notes/s) at {f_['rate300']:.1f}% on {nfmt(f_['n'])} taps.")
+    knee = agg.get("speed_knee")
+    if knee:
+        A(f"- **Falls below it from:** {_bpm_band(knee)} at {knee['rate300']:.1f}% on "
+          f"{nfmt(knee['n'])} taps.")
     A(f"- **Reference level:** {_num(agg.get('sparse_rate'), '{:.1f}')}% on 1/1–1/2 notes "
       f"({nfmt(agg.get('sparse_n', 0))} taps). Every judgement below is against this, not "
       "against a fixed standard.")
@@ -604,7 +667,7 @@ def markdown(agg, plays, charts=None, cfg=None):
         A("")
 
     # ---- streams
-    A("## 5. Inside streams")
+    A("## 5. Inside fast runs")
     A("")
     rows = [
         ("runs found", nfmt(agg.get("n_runs", 0)), "1/4-or-denser sequences, two notes or longer"),
@@ -623,29 +686,170 @@ def markdown(agg, plays, charts=None, cfg=None):
     ]
     A(table(["quantity", "value", "meaning"], rows, ["left", "right", "left"]))
     A("")
-    A("> **What the first-interval figures mean.** They check whether a stream begins "
+    A("> **What the first-interval figures mean.** They check whether a run begins "
       "on the beat or is already broken before it gets going. These two patterns look "
       "very different here. A player who starts cleanly and then drifts shows a low "
       "figure at the first pair with worse numbers deeper into the run. A player whose "
       "beat never establishes shows a high figure at the very first pair that does not "
       "then get worse. The run-length table below separates them: a deficit at 2 notes "
-      "is about the alternating pair itself, while a deficit that only appears at 11+ "
-      "is about holding on.")
+      "is about the alternating pair itself, while one that keeps growing through "
+      "21-40 and 41-80 is about holding on.")
     A("")
     rl = [r for r in agg.get("by_run_len", []) if r["n"] >= 10]
     if rl:
-        A("**Accuracy by how long the unbroken run is** — a deficit at 2 notes means the "
-          "problem is in the alternating pair itself; a deficit that grows with length "
-          "means endurance or drift:")
+        A("**Accuracy by how long the unbroken run is.** A deficit at 2 notes is the "
+          "alternating pair itself; one that grows with length is endurance. Only "
+          "compare rows with similar spacing — longer runs sit on slower maps:")
         A("")
-        A(table(["run length", "taps", "300-rate"],
-                [(f"{r['bucket']} notes", nfmt(r["n"]), _num(r["rate300"], "{:.1f}%")) for r in rl]))
+        A(table(["run length", "taps", "300-rate", "median spacing"],
+                [(f"{r['bucket']} notes", nfmt(r["n"]), _num(r["rate300"], "{:.1f}%"),
+                  _num(r.get("spacing_ms"), "{:.0f} ms")) for r in rl]))
     if charts.get("runlen"):
         A(f"![accuracy by run length]({charts['runlen']})")
         A("")
+    bp = [r for r in agg.get("by_run_pos", []) if r["n"] >= 20]
+    if len(bp) > 1:
+        A("**Accuracy by position inside the run.** Length buckets are confounded by which "
+          "map a run came from; this asks the narrower question of whether a run degrades "
+          "as it goes on, with the same runs counted at each position:")
+        A("")
+        A(table(["notes into the run", "taps", "300-rate", "mean abs error"],
+                [(r["band"], nfmt(r["n"]), _num(r["rate300"], "{:.1f}%"),
+                  _num(r["abs_err"], "{:.1f} ms")) for r in bp]))
+        A("")
+        A(f"*{_num(agg.get('in_run_pct'), '{:.0f}%')} of taps sit inside a run of two or "
+          f"more notes; the rest are isolated or on slower spacing.*")
+        A("")
+
+    # ---- aim
+    A("## 6. Aim, and what it costs")
+    A("")
+    A("The client only accepts a press when the cursor is inside the circle, so a note "
+      "can be lost because the tap was mistimed or because the cursor was not there. "
+      "Both are counted, and every note that never scored has one of those two causes:")
+    A("")
+    aim_rows = [
+        ("notes accepted", nfmt(agg.get("aim_judged", 0)),
+         "presses the client acted on"),
+        ("lost to aim", nfmt(agg.get("aim_miss_offcircle", 0)),
+         "a press arrived inside the timing window but the cursor was outside the circle, "
+         "so the client ignored it"),
+        ("lost with no press", nfmt(agg.get("aim_miss_nopress", 0)),
+         "no press anywhere near the note"),
+        ("presses thrown away for position",
+         f"{nfmt(agg.get('presses_offcircle', 0))} "
+         f"({_num(agg.get('presses_offcircle_pct'), '{:.1f}%')} of all presses)",
+         "share of every press that produced nothing because of where the cursor was"),
+    ]
+    A(table(["quantity", "value", "meaning"], aim_rows, ["left", "right", "left"]))
+    A("")
+    A(f"Of the {nfmt((agg.get('aim_miss_offcircle', 0) or 0) + (agg.get('aim_miss_nopress', 0) or 0))} "
+      f"notes that never scored, {_num(agg.get('aim_miss_offcircle_pct'), '{:.0f}%')} "
+      f"had a press that was ignored for position and the rest were never pressed.")
+    if agg.get("aim_free_notes"):
+        A(f"{nfmt(agg['aim_free_notes'])} notes "
+          f"({_num(agg.get('aim_free_pct'), '{:.1f}%')}) sit at the same position as the note "
+          f"before them — stacked or doubled circles — so reaching them takes no cursor "
+          f"movement. They are left out of the arrival and travel figures below.")
+        A("")
+    if agg.get("presses_locked"):
+        A(f"{nfmt(agg.get('presses_locked'))} presses "
+          f"({_num(agg.get('presses_locked_pct'), '{:.2f}%')}) were refused by note lock: "
+          f"they arrived before the previous circle had been hit, so the client ignored them.")
+    A("")
+    A("**When the cursor arrives.** Arrival is the moment the cursor last crossed into "
+      "the circle before the press, solved by interpolating between the two frames either "
+      "side of that crossing. A negative figure means the pen was already waiting; a "
+      "positive one means it was still on its way at the note's own time.")
+    A("")
+    A(table(["quantity", "value", "meaning"], [
+        ("median arrival", f"{_num(agg.get('arrival_median_ms'), '{:+.0f}')} ms",
+         "negative means the cursor was in place before the note"),
+        ("arrived after the note", _num(agg.get("arrived_late_pct"), "{:.1f}%"),
+         "notes where the cursor was still on its way at the note's time"),
+    ], ["left", "right", "left"]))
+    A("")
+    A("**Was the pen still travelling when it tapped?** Every accepted press is split by "
+      "whether the cursor was moving more than 0.5 osu!pixels per millisecond at the "
+      "press, measured between the cursor positions interpolated 8 ms either side of it. "
+      "Same notes, same speeds, sorted by whether the hand was still carrying the cursor "
+      "at the moment of the tap:")
+    A("")
+    A(table(["at the press", "taps", "300-rate", "mean abs error"], [
+        ("still travelling", nfmt(agg.get("moving_n", 0)),
+         _num(agg.get("moving_rate300"), "{:.1f}%"), _num(agg.get("moving_abs_err"), "{:.1f} ms")),
+        ("cursor settled", nfmt(agg.get("stationary_n", 0)),
+         _num(agg.get("stationary_rate300"), "{:.1f}%"), _num(agg.get("stationary_abs_err"), "{:.1f} ms")),
+    ], ["left", "right", "right", "right"]))
+    A("")
+    by_in = agg.get("aim_by_input") or []
+    if len(by_in) > 1:
+        A("**Which input pays.** The same split by whichever input produced the press:")
+        A("")
+        A(table(["input", "taps accepted", "300-rate", "arrived after the note",
+                 "presses lost to position"],
+                [(r["name"], nfmt(r["judged"]), _num(r["rate300"], "{:.1f}%"),
+                  _num(r["late_pct"], "{:.1f}%"), nfmt(r["offcircle_presses"])) for r in by_in]))
+        A("")
+    pat = [r for r in (agg.get("pattern_by_class") or []) if r["n"]]
+    if len(pat) > 1:
+        A("**How stream patterns were played, and how they scored.** Counted as stream "
+          "play here: 1/4-or-denser, inside a run, with the input changing on every note. "
+          "They are separated in circle diameters, and the same spacing played with one "
+          "input gets its own rows:")
+        A("")
+        A(table(["how it was played", "notes", "300-rate", "pen share", "300-rate, pen only"],
+                [(r["pattern"] + (" *" if r["n"] < 50 else ""), nfmt(r["n"]),
+                  _num(r["rate300"], "{:.1f}%"), _num(r["pen_pct"], "{:.0f}%"),
+                  _num(r.get("rate300_pen"), "{:.1f}%")) for r in pat]))
+        A("")
+        A("*Rows marked with an asterisk carry fewer than 50 notes and should be read as a "
+          "hint, not a measurement. A stream is alternated by definition here, so the same "
+          "spacing played with one input is listed separately rather than counted as a "
+          "stream.*")
+        A("")
+    sep = [r for r in (agg.get("pattern_by_sep") or []) if r["n"] >= 20]
+    if len(sep) > 1:
+        A("**Accuracy against how far apart the circles are**, in circle diameters, "
+          "measured from the previous note. 1.0 is the point where the circles just stop "
+          "overlapping; this table ignores technique, so it mixes alternating and "
+          "single-tapped notes and answers only how spacing relates to accuracy:")
+        A("")
+        A(table(["separation", "notes", "300-rate", "mean abs error"],
+                [(f"{r['band']} circles", nfmt(r["n"]), _num(r["rate300"], "{:.1f}%"),
+                  _num(r["abs_err"], "{:.1f} ms")) for r in sep]))
+        A("")
+        base = agg.get("pattern_sep_baseline")
+        knee = agg.get("pattern_sep_knee")
+        wide_rate = agg.get("pattern_sep_widest_rate")
+        wide_band = agg.get("pattern_sep_widest")
+        if knee:
+            A(f"Accuracy holds at {_num(base, '{:.1f}%')} out to "
+              f"{agg.get('pattern_sep_baseline_band')} circle diameters, then falls away: "
+              f"{_num(agg.get('pattern_sep_knee_rate'), '{:.1f}%')} at {knee}.")
+        elif wide_rate == wide_rate and base == base and wide_rate >= base + 2.0:
+            A(f"Accuracy rises with separation rather than falling: {_num(base, '{:.1f}%')} "
+              f"at {agg.get('pattern_sep_baseline_band')} circle diameters against "
+              f"{_num(wide_rate, '{:.1f}%')} at {wide_band}. Notes further apart score higher "
+              f"here than notes close together, not lower.")
+        else:
+            A(f"Accuracy is flat across separations: {_num(base, '{:.1f}%')} at "
+              f"{agg.get('pattern_sep_baseline_band')} circle diameters and "
+              f"{_num(wide_rate, '{:.1f}%')} at {wide_band}.")
+        A("")
+    A("> **What this section is for.** Timing error and aim error are not independent: a "
+      "note the cursor never reaches is lost whatever the tap did, and a tap landing while "
+      "the hand is still moving is a different act from a tap on a settled cursor. The two "
+      "tables above separate them. If the 300-rate is flat between travelling and settled, "
+      "aim is not taxing the timing and the deficit is pure tap timing. If travelling taps "
+      "lose accuracy, the loss attributed to 'timing' includes the cost of aiming at the "
+      "same moment, and practising the tap alone cannot recover it. The position losses "
+      "say the same thing more bluntly: those notes never had a chance to be timed well or "
+      "badly.")
+    A("")
 
     # ---- maps
-    A("## 6. Maps analysed")
+    A("## 7. Maps analysed")
     A("")
     rows = []
     for p in sorted(plays, key=lambda x: (-(x.stars if x.stars == x.stars else 0))):

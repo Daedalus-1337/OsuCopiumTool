@@ -149,6 +149,20 @@ class Play:
     run_id: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=int))
     run_len: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=int))
     run_pos: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=int))
+    # aim, per note across the whole map rather than only judged notes
+    aim_state: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=int))
+    aim_err: np.ndarray = field(default_factory=lambda: np.zeros(0))
+    aim_dist: np.ndarray = field(default_factory=lambda: np.zeros(0))
+    aim_arrival: np.ndarray = field(default_factory=lambda: np.zeros(0))
+    aim_speed: np.ndarray = field(default_factory=lambda: np.zeros(0))
+    aim_jump: np.ndarray = field(default_factory=lambda: np.zeros(0))
+    aim_arrival_clamped: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=bool))
+    aim_free: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=bool))
+    aim_divisor: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=int))
+    radius_px: float = float('nan')
+    press_reasons: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=int))
+    press_bits: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=int))
+    aim_btn: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=int))
 
     @property
     def url(self) -> str:
@@ -170,6 +184,190 @@ class Play:
         return f"{self.artist} - {self.title}{v}"
 
 
+# --------------------------------------------------------------- the client ---
+def presses_with_position(rep):
+    """Every button press with the cursor position at that instant.
+
+    Mirrors analyze.press_events, which discards position, and keeps each frame's
+    x/y so a press can be judged the way the client routes it: by what the cursor
+    is over, not by which note happens to be closest in time.
+    """
+    out, prev = [], 0
+    for f in rep.frames:
+        changed = f.keys ^ prev
+        for bit in analyze.BUTTON_NAMES:
+            if changed & bit and (f.keys & bit):
+                out.append((f.t, bit, f.x, f.y))
+        prev = f.keys
+    out.sort()
+    return out
+
+
+def circle_radius(cs: float) -> float:
+    """osu! circle radius in osu!pixels, the unit replay frames and .osu use."""
+    return max(4.0, 54.4 - 4.48 * cs)
+
+
+def frame_arrays(rep):
+    """Frame times and positions as arrays, for cursor lookups."""
+    ft = np.fromiter((f.t for f in rep.frames), dtype=float, count=len(rep.frames))
+    fx = np.fromiter((f.x for f in rep.frames), dtype=float, count=len(rep.frames))
+    fy = np.fromiter((f.y for f in rep.frames), dtype=float, count=len(rep.frames))
+    return ft, fx, fy
+
+
+def positional_pair(note_t, note_xy, radius, presses, blocks):
+    """Judge presses against notes the way the client does: by position first.
+
+    A press only judges a note whose circle contains the cursor, taking the one
+    nearest in time among those under it. A press whose cursor is over nothing
+    judges nothing. A press that would judge a circle is refused while an earlier
+    circle is still unjudged and the press arrives before that circle's time.
+
+    Returns per-note arrays and a per-press reason code.
+    """
+    n = len(note_t)
+    t = np.asarray(note_t, dtype=float)
+    w300, w100, w50 = analyze.W300, analyze.W100, analyze.W50
+    err = np.full(n, np.nan)
+    btn = np.zeros(n, dtype=int)
+    hit = np.zeros(n, dtype=bool)
+    dist = np.full(n, np.nan)
+    press_t = np.full(n, np.nan)
+    press_x = np.full(n, np.nan)
+    press_y = np.full(n, np.nan)
+    offcircle_press = np.zeros(n, dtype=bool)
+    judged = np.zeros(n, dtype=bool)
+    press_bits = np.zeros(len(presses), dtype=int)
+    reason = np.zeros(len(presses), dtype=int)      # 0 judged, 1 off circle, 2 locked, 3 no note in window
+
+    for k, (pt, bit, px, py) in enumerate(presses):
+        press_bits[k] = bit
+        lo = int(np.searchsorted(t, pt - w50, side="left"))
+        hi = int(np.searchsorted(t, pt + w50, side="right"))
+        best, best_gap, saw_off = -1, 1e9, False
+        for i in range(lo, hi):
+            if judged[i]:
+                continue
+            d = math.hypot(note_xy[i][0] - px, note_xy[i][1] - py)
+            if d <= radius:
+                gap = abs(t[i] - pt)
+                if gap < best_gap:
+                    best_gap, best = gap, i
+            else:
+                saw_off = True
+        if best < 0:
+            reason[k] = 1 if saw_off else 3
+            if saw_off:
+                for i in range(lo, hi):
+                    if not judged[i]:
+                        offcircle_press[i] = True
+            continue
+        # note lock: an earlier circle still unjudged refuses a press arriving
+        # before that circle's own start time
+        locked = False
+        for j in range(best - 1, -1, -1):
+            if blocks[j] and not judged[j]:
+                locked = pt < t[j]
+                break
+        if locked:
+            reason[k] = 2
+            continue
+        err[best] = pt - t[best]
+        btn[best] = bit
+        hit[best] = True
+        judged[best] = True
+        dist[best] = math.hypot(note_xy[best][0] - px, note_xy[best][1] - py)
+        press_t[best] = pt
+        press_x[best] = px
+        press_y[best] = py
+        reason[k] = 0
+    return (err, btn, hit, dist, press_t, press_x, press_y,
+            offcircle_press, reason, press_bits)
+
+
+def position_at(ft, fx, fy, t):
+    """Cursor position at an arbitrary time, interpolated between the two frames
+    that bracket it."""
+    k = int(np.searchsorted(ft, t, side="right")) - 1
+    if k < 0:
+        return float(fx[0]), float(fy[0])
+    if k >= len(ft) - 1:
+        return float(fx[-1]), float(fy[-1])
+    span = float(ft[k + 1] - ft[k])
+    if span <= 0:
+        return float(fx[k]), float(fy[k])
+    w = (t - ft[k]) / span
+    return (float(fx[k]) + w * (fx[k + 1] - fx[k]),
+            float(fy[k]) + w * (fy[k + 1] - fy[k]))
+
+
+def crossing_time(cx, cy, radius, ft, fx, fy, anchor, back_limit=1000.0):
+    """Time the cursor last crossed into the circle before `anchor`.
+
+    Walks back from the anchor while the samples stay inside the circle, so an
+    earlier pass through it does not count as an arrival, then solves the crossing
+    between the last outside sample and the first inside one. Returns
+    (time, clamped); clamped means the cursor had been inside for longer than
+    `back_limit` and its entry is earlier than can be measured.
+    """
+    k = int(np.searchsorted(ft, anchor, side="right")) - 1
+    if k < 0:
+        return float("nan"), False
+    if math.hypot(fx[k] - cx, fy[k] - cy) > radius:
+        return float("nan"), False
+    j = k
+    while j > 0:
+        if ft[k] - ft[j - 1] > back_limit:
+            return float("nan"), True
+        if math.hypot(fx[j - 1] - cx, fy[j - 1] - cy) > radius:
+            break
+        j -= 1
+    if j == 0:
+        return float("nan"), True
+
+    d0 = math.hypot(fx[j - 1] - cx, fy[j - 1] - cy)
+    d1 = math.hypot(fx[j] - cx, fy[j] - cy)
+    frac = (d0 - radius) / (d0 - d1) if d0 > d1 else 0.0
+    frac = min(max(frac, 0.0), 1.0)
+    return float(ft[j - 1] + frac * (ft[j] - ft[j - 1])), False
+
+
+def aim_arrays(note_t, note_xy, radius, ft, fx, fy, press_t, speed_half=8.0):
+    """Per-note aim quantities.
+
+    arrival  when the cursor last crossed into the circle, relative to the note's
+             time. Anchored on the press where the note was judged, on the note's
+             own time where it was not.
+    speed    cursor speed in osu!px/ms at the press, as a central difference on the
+             interpolated path
+    jump     distance from the previous note's position, i.e. travel required
+    """
+    n = len(note_t)
+    arrival = np.full(n, np.nan)
+    clamped = np.zeros(n, dtype=bool)
+    speed_at = np.full(n, np.nan)
+    jump = np.full(n, np.nan)
+    aim_free = np.zeros(n, dtype=bool)
+    for i in range(n):
+        if i > 0:
+            jump[i] = math.hypot(note_xy[i][0] - note_xy[i - 1][0],
+                                 note_xy[i][1] - note_xy[i - 1][1])
+            aim_free[i] = jump[i] <= AIM_FREE_PX
+        cx, cy = note_xy[i]
+        pt = press_t[i]
+        anchor = pt if math.isfinite(pt) else note_t[i]
+        mu, was_clamped = crossing_time(cx, cy, radius, ft, fx, fy, anchor)
+        if math.isfinite(mu):
+            arrival[i] = mu - note_t[i]
+        clamped[i] = was_clamped
+        if math.isfinite(pt):
+            x1, y1 = position_at(ft, fx, fy, pt - speed_half)
+            x2, y2 = position_at(ft, fx, fy, pt + speed_half)
+            speed_at[i] = math.hypot(x2 - x1, y2 - y1) / (2.0 * speed_half)
+    return arrival, speed_at, jump, clamped, aim_free
+
+
 def analyse_replay(osr_path: Path, osu_path: Path, stars: float = float("nan")) -> Play | None:
     """Judge one replay against its beatmap and return a populated Play."""
     rep = osr_parse.load(str(osr_path))
@@ -184,20 +382,41 @@ def analyse_replay(osr_path: Path, osu_path: Path, stars: float = float("nan")) 
     game = {"300": rep.count_300, "100": rep.count_100, "50": rep.count_50,
             "miss": rep.count_miss}
 
-    rate, delta, residual, modc = analyze.calibrate(
+    rate, delta, _residual, modc = analyze.calibrate(
         raw_t, presses, bm.od, rep.mods, game, len(bm.objects) - len(taps))
     nt_map = raw_t / rate
-    err, btn, hit, pt, _stray, _st = analyze.judge(nt_map, presses, delta=delta)
+    # HardRock mirrors the playfield and enlarges circle size, so the note
+    # positions have to be transformed into the space the cursor moved in
+    hr = bool(rep.mods & 16)
+    cs_eff = min(10.0, bm.cs * 1.3) if hr else bm.cs
+    note_xy = [(o.x, (384.0 - o.y) if hr else o.y) for o in taps]
+    radius = circle_radius(cs_eff)
+    blocks = np.array([o.is_circle for o in taps], dtype=bool)
+    (err, btn, hit, dist, press_t, press_x, press_y,
+     offcircle, press_reasons, press_bits) = positional_pair(
+        nt_map - delta, note_xy, radius, presses_with_position(rep), blocks)
     if not hit.any():
         return None
 
     speed = analyze.speed_from_mods(rep.mods)
     if abs(speed - 1.0) > 1e-9:
         err = err / speed
-        pt = pt / speed
         analyze.W300 /= speed
         analyze.W100 /= speed
         analyze.W50 /= speed
+
+    # counts from this model, for validation against the replay's own counts
+    judged_err = np.abs(err[hit])
+    c300 = int((judged_err <= analyze.W300).sum())
+    c100 = int(((judged_err > analyze.W300) & (judged_err <= analyze.W100)).sum())
+    c50 = int(((judged_err > analyze.W100) & (judged_err <= analyze.W50)).sum())
+    residual = (abs(c300 - game["300"]) + abs(c100 - game["100"])
+                + abs(c50 - game["50"]) + abs(int((~hit).sum()) - game["miss"]))
+
+    ft, fx, fy = frame_arrays(rep)
+    arrival, speed_at, jump, arrival_clamped, aim_free = aim_arrays(
+        nt_map, note_xy, radius, ft, fx, fy, press_t)
+    aim_state = np.where(hit, 0, np.where(offcircle, 1, 2)).astype(np.int8)
 
     # wall-clock spacing between consecutive notes, and its snap label
     gap_map = np.diff(nt_map, prepend=nt_map[0])
@@ -259,7 +478,32 @@ def analyse_replay(osr_path: Path, osu_path: Path, stars: float = float("nan")) 
         count_residual=residual, clock_delta=delta, w300=analyze.W300,
         w100=analyze.W100, w50=analyze.W50, speed=speed,
         err=err[m], button=btn[m], gap=gap_wall[m], divisor=divisor[m],
-        eff_bpm=eff[m], run_id=run_id[m], run_len=run_len[m], run_pos=run_pos[m])
+        eff_bpm=eff[m], run_id=run_id[m], run_len=run_len[m], run_pos=run_pos[m],
+        aim_state=aim_state, aim_err=err, aim_dist=dist, aim_arrival=arrival,
+        aim_speed=speed_at, aim_jump=jump, press_reasons=press_reasons,
+        aim_arrival_clamped=arrival_clamped, aim_free=aim_free,
+        aim_divisor=divisor, radius_px=radius,
+        press_bits=press_bits, aim_btn=btn)
+
+
+# Mods where the input on the replay is not the player's: relax and autoplay and
+# cinema have the client pressing, autopilot has the client aiming. None of them
+# can be measured as tapping.
+CLIENT_INPUT_MODS = {
+    128: "relax: the client supplies the taps",
+    2048: "autoplay: the client plays the map",
+    8192: "autopilot: the client supplies the aim",
+    4194304: "cinema: the client plays the map",
+}
+
+
+def client_input_reason(mods):
+    """Reason string if the client produced the input, else None."""
+    m = int(mods)
+    for bit in sorted(CLIENT_INPUT_MODS):
+        if m // bit % 2:
+            return CLIENT_INPUT_MODS[bit]
+    return None
 
 
 def load_folder(replays_dir, maps_dir, osz_dir=None, songs=None, stars=None,
@@ -285,6 +529,10 @@ def load_folder(replays_dir, maps_dir, osz_dir=None, songs=None, stars=None,
             continue
         if rep.mode != 0:
             skipped.append((f.name, f"mode {rep.mode} is not osu!standard"))
+            continue
+        why = client_input_reason(rep.mods)
+        if why:
+            skipped.append((f.name, why))
             continue
         osu, _how = resolve_beatmap(f, rep.beatmap_hash, idx, maps_dir, osz_dir, songs)
         if osu is None:
@@ -404,7 +652,17 @@ def aggregate(plays, cfg=None):
     # restricted curve, against the player's own non-alternating notes as the
     # reference level, so they say how fast he can go before his accuracy drops
     # relative to how he plays everything else.
-    out["by_bpm"], out["by_bpm_stream"] = [], []
+    # Was this tap struck with a different input than the tap before it? Computed
+    # inside each play, so the join between two plays is not read as a change.
+    alt_here = np.zeros(len(btn), dtype=bool)
+    _k = 0
+    for _p in plays:
+        _b = np.asarray(_p.button, dtype=int)
+        if len(_b) > 1:
+            alt_here[_k + 1:_k + len(_b)] = _b[1:] != _b[:-1]
+        _k += len(_b)
+
+    out["by_bpm"], out["by_bpm_stream"], out["by_bpm_alt"] = [], [], []
     out["speed_plateau"] = out["sparse_rate"]
     out["speed_ceiling"] = None
     out["speed_knee"] = None
@@ -425,19 +683,35 @@ def aggregate(plays, cfg=None):
             if n2 >= 10:
                 out["by_bpm_stream"].append({
                     "lo": float(a), "hi": float(b), "n": n2, "rate300": rate2,
-                    "ci": ci2,
+                    "ci": ci2, "alt_pct": 100.0 * float(alt_here[ms].mean()),
                     "divisor_mix": {int(d): int(((div == d) & ms).sum())
                                     for d in np.unique(div[ms]) if d > 0}})
-        elig = [r for r in out["by_bpm_stream"] if r["n"] >= ceil_min]
+            ma = ms & alt_here
+            n3, rate3, ci3 = _rate(ma, ok)
+            if n3 >= 10:
+                out["by_bpm_alt"].append({
+                    "lo": float(a), "hi": float(b), "n": n3, "rate300": rate3,
+                    "ci": ci3})
+        # the ceiling and the knee are read off alternated stream taps where there
+        # are enough of them, because a slow bucket played with one input measures
+        # single tapping rather than alternating
+        alt_elig = [r for r in out["by_bpm_alt"] if r["n"] >= ceil_min]
+        if len(alt_elig) >= 2:
+            elig = alt_elig
+            out["speed_basis"] = "alternated stream taps"
+        else:
+            elig = [r for r in out["by_bpm_stream"] if r["n"] >= ceil_min]
+            out["speed_basis"] = "1/4-or-denser taps, alternating or not"
         # ceiling: the fastest bucket reached without having fallen below the
         # absolute threshold, counting only the contiguous climb from the
         # slowest eligible bucket
+        # the fastest bucket that clears the bar. Accuracy is not required to hold
+        # on the way up to it: the bucket where it falls away is reported separately
+        # as the knee, so a dip mid-curve is not hidden by a contiguous-climb rule.
         ceiling = None
         for r in elig:
             if r["rate300"] >= ceil_300:
                 ceiling = r
-            else:
-                break
         out["speed_ceiling"] = ceiling
         # the fastest speed with a substantial sample, whatever the accuracy is:
         # a single threshold answers "how fast did you hold the bar" but hides
@@ -461,8 +735,35 @@ def aggregate(plays, cfg=None):
     out["fingerprint"] = fingerprint(plays, btn, div, gap)
 
     # ---- runs, alternation and phase
+    # accuracy against position inside a run: does a run degrade as it goes on?
+    rpos = np.concatenate([p.run_pos for p in plays])
+    rlen = np.concatenate([p.run_len for p in plays])
+    in_run = rlen >= 2
+    by_pos = []
+    for lo, hi, label in ((0, 1, "1-2"), (2, 3, "3-4"), (4, 6, "5-7"),
+                          (7, 11, "8-12"), (12, 10 ** 9, "13+")):
+        m = np.logical_and(in_run, np.logical_and(rpos >= lo, rpos <= hi))
+        if m.any():
+            by_pos.append({"band": label, "n": int(m.sum()),
+                           "rate300": 100.0 * float(ok[m].mean()),
+                           "abs_err": float(np.abs(err[m]).mean())})
+    out["by_run_pos"] = by_pos
+    out["in_run_taps"] = int(in_run.sum())
+    out["in_run_pct"] = 100.0 * float(in_run.mean()) if len(in_run) else float("nan")
+    early = [r for r in by_pos if r["band"] in ("1-2", "3-4")]
+    deep = [r for r in by_pos if r["band"] in ("5-7", "8-12")]
+    if early and deep:
+        en = sum(r["n"] for r in early)
+        dn = sum(r["n"] for r in deep)
+        out["run_pos_early_rate"] = sum(r["rate300"] * r["n"] for r in early) / en
+        out["run_pos_early_n"] = en
+        out["run_pos_deep_rate"] = sum(r["rate300"] * r["n"] for r in deep) / dn
+        out["run_pos_deep_n"] = dn
+
     runs = run_stats(plays, cfg)
     out.update(runs)
+    out.update(pool_aim_sums([play_aim_sums(p) for p in plays]))
+    out.update(pool_pattern_sums([play_pattern_sums(p) for p in plays]))
 
     # ---- per input
     out["inputs"] = []
@@ -518,13 +819,13 @@ def fingerprint(plays, btn, div, gap):
         res["detail"] = ("No notes at 1/4 or denser were played, so the alternation "
                          "behaviour cannot be judged.")
     elif s_slow < 15 and s_dense > 35:
-        res["verdict"] = "alternates on streams only"
+        res["verdict"] = "alternates on fast notes only"
         res["detail"] = (
             f"A second input is used for {s_slow:.0f}% of notes at 1/2 and slower but "
             f"{s_dense:.0f}% at 1/4 and denser. One input carries all the slow notes "
             "and the other joins only when the notes outrun it. This is the pattern "
             "of a player tapping with a pen tip or one finger and reaching for a "
-            "second key for streams.")
+            "second key when the notes get fast.")
     elif s_slow > 35 and s_dense > 35:
         res["verdict"] = "alternates throughout"
         res["detail"] = (
@@ -552,11 +853,18 @@ def play_rate_sums(play):
     err = play.err
     ok = np.abs(err) <= w
     dense = play.divisor >= STREAM_DIVISOR
+    _b = np.asarray(play.button, dtype=int)
+    alt = np.zeros(len(_b), dtype=bool)
+    if len(_b) > 1:
+        alt[1:] = _b[1:] != _b[:-1]
+    alt_dense = np.logical_and(dense, alt)
     sparse = (play.divisor > 0) & (play.divisor <= SPARSE_DIVISOR)
     s = {"n": int(len(err)), "n_ok": int(ok.sum()),
          "sum_e": float(err.sum()), "sum_e2": float((err * err).sum()),
          "late": int((err > 0).sum()), "off300": int((~ok).sum()),
          "n_dense": int(dense.sum()), "dense_ok": int((ok & dense).sum()),
+         "n_alt_dense": int(alt_dense.sum()), "alt_dense_ok": int((ok & alt_dense).sum()),
+         "alt_dense_ss": 0.0, "n_alt_dense_sd": 0,
          "n_sparse": int(sparse.sum()), "sparse_ok": int((ok & sparse).sum()),
          "dense_ss": 0.0, "n_dense_sd": 0, "sparse_ss": 0.0, "n_sparse_sd": 0,
          "ss_within": 0.0, "gain": 0.0, "gain_n": 0}
@@ -566,6 +874,10 @@ def play_rate_sums(play):
         e = err[dense]
         s["dense_ss"] = float(((e - e.mean()) ** 2).sum())
         s["n_dense_sd"] = s["n_dense"]
+    if s["n_alt_dense"] > 1:
+        e = err[alt_dense]
+        s["alt_dense_ss"] = float(((e - e.mean()) ** 2).sum())
+        s["n_alt_dense_sd"] = s["n_alt_dense"]
     if s["n_sparse"] > 1:
         e = err[sparse]
         s["sparse_ss"] = float(((e - e.mean()) ** 2).sum())
@@ -612,6 +924,12 @@ def pool_rate_sums(sums):
         "sparse_n": tot["n_sparse"],
         "dense_sd_within": (math.sqrt(tot["dense_ss"] / tot["n_dense_sd"])
                             if tot["n_dense_sd"] else float("nan")),
+        "alt_rate": pct(tot["alt_dense_ok"], tot["n_alt_dense"]),
+        "alt_rate_ci": wilson(tot["alt_dense_ok"], tot["n_alt_dense"]),
+        "alt_n": tot["n_alt_dense"],
+        "alt_share_of_fast": pct(tot["n_alt_dense"], tot["n_dense"]),
+        "alt_sd_within": (math.sqrt(tot["alt_dense_ss"] / tot["n_alt_dense_sd"])
+                          if tot["n_alt_dense_sd"] else float("nan")),
         "dense_sd_n": tot["n_dense_sd"],
         "sparse_sd_within": (math.sqrt(tot["sparse_ss"] / tot["n_sparse_sd"])
                              if tot["n_sparse_sd"] else float("nan")),
@@ -619,7 +937,25 @@ def pool_rate_sums(sums):
     }
     out["degradation"] = (out["dense_sd_within"] / out["sparse_sd_within"]
                           if out["sparse_sd_within"] else float("nan"))
+    out["alt_degradation"] = (out["alt_sd_within"] / out["sparse_sd_within"]
+                              if out["sparse_sd_within"] else float("nan"))
     return out
+
+
+# Run-length buckets, in display order. The top bucket is open-ended. Each bucket
+# also carries its median note spacing, because long runs tend to occur on slower
+# maps and a bare 300-rate per bucket is then not like for like.
+RUN_LENGTH_BUCKETS = ((2, 2, "2"), (3, 5, "3-5"), (6, 10, "6-10"),
+                      (11, 20, "11-20"), (21, 40, "21-40"), (41, 80, "41-80"),
+                      (81, None, "81+"))
+
+
+def run_length_bucket(n: int) -> str:
+    """Bucket name for a run of n notes."""
+    for lo, hi, name in RUN_LENGTH_BUCKETS:
+        if n >= lo and (hi is None or n <= hi):
+            return name
+    return RUN_LENGTH_BUCKETS[-1][2]
 
 
 def play_run_sums(play):
@@ -635,7 +971,8 @@ def play_run_sums(play):
          "n_same": 0, "sum_d2": 0.0, "n_alt": 0, "sum_alt": 0.0,
          "sum_alt2": 0.0, "sum_com2": 0.0, "n_entry": 0, "entry_off15": 0,
          "entry_off30": 0, "entry_devs": [], "gridvals": [], "offsets": [],
-         "by_len": {"2": [0, 0], "3-5": [0, 0], "6-10": [0, 0], "11+": [0, 0]}}
+         "by_len": {name: [0, 0] for _, _, name in RUN_LENGTH_BUCKETS},
+         "by_len_spacing": {name: [] for _, _, name in RUN_LENGTH_BUCKETS}}
     p = play
     ids_all = [i for i in range(len(p.err)) if p.run_len[i] > 0]
     if not ids_all:
@@ -645,15 +982,16 @@ def play_run_sums(play):
         if len(idx) < 2:
             continue
         s["n_runs"] += 1
-        bucket = ("2" if len(idx) == 2 else "3-5" if len(idx) <= 5
-                  else "6-10" if len(idx) <= 10 else "11+")
+        bucket = run_length_bucket(len(idx))
         for i in idx:
             s["by_len"][bucket][0] += 1
             s["by_len"][bucket][1] += int(abs(p.err[i]) <= p.w300)
         d = np.diff(p.err[idx])
         g = p.gap[idx][1:]
         if len(g):
-            s["gridvals"].append(float(np.median(g)))
+            spacing = float(np.median(g))
+            s["gridvals"].append(spacing)
+            s["by_len_spacing"][bucket].append(spacing)
         s["n_int"] += len(d)
         s["sum_d2"] += float((d * d).sum())
         dev = d / g
@@ -702,6 +1040,8 @@ def add_run_sums(a, b):
     out["by_len"] = {k: [a["by_len"][k][0] + b["by_len"][k][0],
                          a["by_len"][k][1] + b["by_len"][k][1]]
                      for k in a["by_len"]}
+    out["by_len_spacing"] = {k: a["by_len_spacing"][k] + b["by_len_spacing"][k]
+                             for k in a["by_len_spacing"]}
     return out
 
 
@@ -728,7 +1068,9 @@ def pool_run_sums(sums):
     out["entry_median_pct"] = 100 * float(np.median(ed)) if ed else float("nan")
     out["n_entry"] = len(ed)
     out["by_run_len"] = [{"bucket": k, "n": v[0],
-                          "rate300": (100 * v[1] / v[0]) if v[0] else float("nan")}
+                          "rate300": (100 * v[1] / v[0]) if v[0] else float("nan"),
+                          "spacing_ms": (float(np.median(tot["by_len_spacing"][k]))
+                                         if tot["by_len_spacing"].get(k) else float("nan"))}
                          for k, v in tot["by_len"].items()]
     if tot["n_alt"]:
         n = tot["n_alt"]
@@ -752,6 +1094,284 @@ def pool_run_sums(sums):
 def run_stats(plays, cfg=None):
     """Everything measured inside stream runs, pooled over plays."""
     return pool_run_sums([play_run_sums(p) for p in plays])
+
+
+# --------------------------------------------------------------------- aim ---
+MOVE_THRESHOLD = 0.5      # osu!px/ms; above this the cursor is still travelling
+AIM_FREE_PX = 1.0         # a note this close to the previous one needs no cursor movement
+JUMP_BANDS = ((0, 50, "0-50"), (50, 100, "50-100"), (100, 200, "100-200"),
+              (200, None, "200+"))
+
+AIM_SUM_KEYS = ("n_notes", "n_judged", "n_aim", "n_nopress", "n_press",
+                "pr_judged", "pr_off", "pr_locked", "pr_window",
+                "n_arrival", "n_late", "n_free")
+
+
+def play_aim_sums(play):
+    """Additive per-play aim sums.
+
+    `aim_state` per note is 0 judged, 1 a press landed with the cursor off the
+    circle, 2 no press at all, so notes that were never judged still carry a
+    cause.
+    """
+    st = np.asarray(play.aim_state)
+    pr = np.asarray(play.press_reasons)
+    pb = np.asarray(play.press_bits)
+    arr = np.asarray(play.aim_arrival, dtype=float)
+    spd = np.asarray(play.aim_speed, dtype=float)
+    jmp = np.asarray(play.aim_jump, dtype=float)
+    err = np.asarray(play.aim_err, dtype=float)
+    btn = np.asarray(play.aim_btn, dtype=int)
+    free = np.asarray(play.aim_free, dtype=bool)
+    ok = np.abs(err) <= play.w300
+    fin = np.logical_and(np.isfinite(arr), np.logical_not(free))
+    judged = np.nonzero(st == 0)[0]
+
+    s = {"n_notes": int(len(st)), "n_judged": int(len(judged)),
+         "n_aim": int((st == 1).sum()), "n_nopress": int((st == 2).sum()),
+         "n_press": int(len(pr)), "pr_judged": int((pr == 0).sum()),
+         "pr_off": int((pr == 1).sum()), "pr_locked": int((pr == 2).sum()),
+         "pr_window": int((pr == 3).sum()),
+         "n_arrival": int(fin.sum()), "n_late": int((arr[fin] > 0).sum()),
+         "n_clamped": int(np.asarray(play.aim_arrival_clamped, dtype=bool).sum()),
+         "n_free": int(free.sum()),
+         "arrivals": arr[fin].tolist(),
+         "moving": [0, 0, 0.0], "stationary": [0, 0, 0.0],
+         "jump": {b[2]: [0, 0, 0.0] for b in JUMP_BANDS},
+         "off_by_bit": {}, "by_bit": {},
+         "n_speed": int(np.isfinite(spd).sum()),
+         "speeds": spd[np.logical_and(np.isfinite(spd), np.logical_not(free))].tolist()}
+
+    for bit in (1, 2, 4, 8):
+        n_off = int(((pb == bit) & (pr == 1)).sum())
+        if n_off:
+            s["off_by_bit"][bit] = n_off
+        sel = judged[btn[judged] == bit] if len(judged) else np.zeros(0, int)
+        if len(sel):
+            late = int((arr[sel][np.isfinite(arr[sel])] > 0).sum())
+            s["by_bit"][bit] = [int(len(sel)), int(ok[sel].sum()), late]
+
+    for i in judged:
+        if free[i]:
+            continue
+        v = spd[i]
+        if np.isfinite(v):
+            bucket = s["moving"] if v > MOVE_THRESHOLD else s["stationary"]
+            bucket[0] += 1
+            bucket[1] += int(bool(ok[i]))
+            bucket[2] += abs(float(err[i]))
+        j = jmp[i]
+        if np.isfinite(j):
+            for lo, hi, name in JUMP_BANDS:
+                if j >= lo and (hi is None or j < hi):
+                    b = s["jump"][name]
+                    b[0] += 1
+                    b[1] += int(bool(ok[i]))
+                    b[2] += abs(float(err[i]))
+                    break
+            else:
+                b = s["jump"][JUMP_BANDS[-1][2]]
+                b[0] += 1
+                b[1] += int(bool(ok[i]))
+                b[2] += abs(float(err[i]))
+    return s
+
+
+def pool_aim_sums(sums):
+    """Finalise pooled aim sums into reported values."""
+    if not sums:
+        return {}
+    tot = {k: 0 for k in AIM_SUM_KEYS}
+    tot["n_clamped"] = 0
+    AIM_SUM_KEYS_LOCAL = AIM_SUM_KEYS + ("n_clamped",)
+    arrivals, speeds, n_speed = [], [], 0
+    moving, stationary = [0, 0, 0.0], [0, 0, 0.0]
+    jump = {b[2]: [0, 0, 0.0] for b in JUMP_BANDS}
+    off_by_bit, by_bit = {}, {}
+    for s in sums:
+        for k in AIM_SUM_KEYS_LOCAL:
+            tot[k] += s.get(k, 0)
+        arrivals.extend(s["arrivals"])
+        speeds.extend(s["speeds"])
+        n_speed += s["n_speed"]
+        for src, dst in ((s["moving"], moving), (s["stationary"], stationary)):
+            for n in range(3):
+                dst[n] += src[n]
+        for k in jump:
+            for n in range(3):
+                jump[k][n] += s["jump"][k][n]
+        for bit, v in s["off_by_bit"].items():
+            off_by_bit[bit] = off_by_bit.get(bit, 0) + v
+        for bit, v in s["by_bit"].items():
+            cur = by_bit.setdefault(bit, [0, 0, 0])
+            for n in range(3):
+                cur[n] += v[n]
+
+    def pct(num, den):
+        return 100.0 * num / den if den else float("nan")
+
+    misses = tot["n_aim"] + tot["n_nopress"]
+    out = {
+        "aim_notes": tot["n_notes"],
+        "aim_judged": tot["n_judged"],
+        "aim_miss_offcircle": tot["n_aim"],
+        "aim_miss_nopress": tot["n_nopress"],
+        "aim_miss_offcircle_pct": pct(tot["n_aim"], misses),
+        "aim_miss_pct": pct(misses, tot["n_notes"]),
+        "presses": tot["n_press"],
+        "presses_offcircle": tot["pr_off"],
+        "presses_offcircle_pct": pct(tot["pr_off"], tot["n_press"]),
+        "presses_locked": tot["pr_locked"],
+        "presses_locked_pct": pct(tot["pr_locked"], tot["n_press"]),
+        "presses_outside_window": tot["pr_window"],
+        "arrival_median_ms": float(np.median(arrivals)) if arrivals else float("nan"),
+        "arrived_late_pct": pct(tot["n_late"], tot["n_arrival"]),
+        "n_arrival": tot["n_arrival"],
+        "arrival_unmeasurable": tot["n_clamped"],
+        "aim_free_notes": tot["n_free"],
+        "aim_free_pct": pct(tot["n_free"], tot["n_judged"]),
+        "speed_median": float(np.median(speeds)) if speeds else float("nan"),
+        "moving_n": moving[0], "moving_rate300": pct(moving[1], moving[0]),
+        "moving_abs_err": (moving[2] / moving[0]) if moving[0] else float("nan"),
+        "stationary_n": stationary[0], "stationary_rate300": pct(stationary[1], stationary[0]),
+        "stationary_abs_err": (stationary[2] / stationary[0]) if stationary[0] else float("nan"),
+        "aim_by_input": [{"bit": bit, "name": BUTTON_LABEL.get(bit, f"bit {bit}"),
+                          "judged": v[0], "rate300": pct(v[1], v[0]),
+                          "late_pct": pct(v[2], v[0]),
+                          "offcircle_presses": off_by_bit.get(bit, 0)}
+                         for bit, v in sorted(by_bit.items())],
+        "aim_by_jump": [{"band": name, "n": jump[name][0],
+                         "rate300": pct(jump[name][1], jump[name][0]),
+                         "abs_err": (jump[name][2] / jump[name][0]) if jump[name][0] else float("nan")}
+                        for _, _, name in JUMP_BANDS],
+    }
+    return out
+
+
+# ---------------------------------------------------------------- patterns ---
+# Separation between consecutive notes, in circle diameters. One diameter is the
+# point where the two circles stop overlapping, which is what separates a stacked
+# stream from a spaced one.
+SEP_BANDS = ((0.0, 0.5, "under 0.5"), (0.5, 1.0, "0.5-1.0"),
+             (1.0, 1.5, "1.0-1.5"), (1.5, 2.0, "1.5-2.0"), (2.0, None, "2.0+"))
+PATTERN_CLASSES = ("stacked stream", "spaced stream",
+                   "single-tapped, stacked", "single-tapped, spaced",
+                   "isolated fast notes", "slow notes")
+
+
+def play_pattern_sums(play):
+    """Additive per-play sums by pattern class and by separation.
+
+    A note is in a stream when its snap divisor is 1/4 or denser. Inside a stream,
+    separation is the distance from the previous note divided by the circle
+    diameter, so 1.0 is where the circles stop overlapping.
+    """
+    n = len(np.asarray(play.aim_err))
+    empty = {"classes": {k: [0, 0, 0, 0] for k in PATTERN_CLASSES},
+             "alt": {k: [0, 0] for k in PATTERN_CLASSES},
+             "bands": {b[2]: [0, 0, 0.0] for b in SEP_BANDS}}
+    if not n:
+        return empty
+    err = np.asarray(play.aim_err, dtype=float)
+    ok = np.abs(err) <= play.w300
+    jump = np.asarray(play.aim_jump, dtype=float)
+    div = np.asarray(play.aim_divisor, dtype=int)
+    r = float(play.radius_px)
+    sep = jump / (2.0 * r) if r and r == r else np.full(n, np.nan)
+    stream = div >= STREAM_DIVISOR
+    finite = np.isfinite(sep)
+    s = {"classes": {k: [0, 0, 0, 0] for k in PATTERN_CLASSES},
+         "alt": {k: [0, 0] for k in PATTERN_CLASSES},
+         "bands": {b[2]: [0, 0, 0.0] for b in SEP_BANDS}}
+    # a note only counts as part of a stream when a neighbouring note is also 1/4
+    # or denser, so an isolated fast note is not mistaken for stream play
+    prev = np.concatenate(([False], stream[:-1]))
+    nxt = np.concatenate((stream[1:], [False]))
+    in_run = np.logical_and(stream, np.logical_or(prev, nxt))
+    bt = np.asarray(play.aim_btn, dtype=int)
+    # a note is alternated when it was struck with a different input than the note
+    # before it; a stream is by definition alternated, so a single-tapped run is
+    # reported separately rather than counted as one
+    alt_here = np.zeros(len(div), dtype=bool)
+    if len(div) > 1:
+        alt_here[1:] = bt[1:] != bt[:-1]
+    stacked = np.logical_and(in_run, np.logical_and(finite, sep < 1.0))
+    spaced = np.logical_and(in_run, np.logical_and(finite, sep >= 1.0))
+    for name, m in (("stacked stream", np.logical_and(stacked, alt_here)),
+                    ("spaced stream", np.logical_and(spaced, alt_here)),
+                    ("single-tapped, stacked", np.logical_and(stacked, np.logical_not(alt_here))),
+                    ("single-tapped, spaced", np.logical_and(spaced, np.logical_not(alt_here))),
+                    ("isolated fast notes", np.logical_and(stream, np.logical_not(in_run))),
+                    ("slow notes", np.logical_not(stream))):
+        pen_mask = np.logical_and(m, bt == 1)
+        s["classes"][name] = [int(m.sum()), int(ok[m].sum()),
+                              int(pen_mask.sum()), int(ok[pen_mask].sum())]
+        both = np.logical_and(m[:-1], m[1:])
+        s["alt"][name][0] = int(both.sum())
+        s["alt"][name][1] = int((bt[:-1][both] != bt[1:][both]).sum())
+    for lo, hi, name in SEP_BANDS:
+        m = np.logical_and(np.logical_and(stream, finite), sep >= lo)
+        m = np.logical_and(m, sep < (hi if hi is not None else 1e9))
+        b = s["bands"][name]
+        b[0] = int(m.sum())
+        b[1] = int(ok[m].sum())
+        e = np.abs(err[m])
+        b[2] = float(e[np.isfinite(e)].sum())
+    return s
+
+
+def pool_pattern_sums(sums):
+    """Finalise pooled pattern sums into reported values."""
+    if not sums:
+        return {}
+    cls = {k: [0, 0, 0, 0] for k in PATTERN_CLASSES}
+    alt = {k: [0, 0] for k in PATTERN_CLASSES}
+    bands = {b[2]: [0, 0, 0.0] for b in SEP_BANDS}
+    for s in sums:
+        for k in cls:
+            v = s["classes"].get(k, [0, 0, 0, 0])
+            for i in range(4):
+                cls[k][i] += v[i]
+            a = s["alt"].get(k, [0, 0])
+            alt[k][0] += a[0]
+            alt[k][1] += a[1]
+        for k in bands:
+            v = s["bands"].get(k, [0, 0, 0.0])
+            for i in range(3):
+                bands[k][i] += v[i]
+
+    def pct(a, b):
+        return 100.0 * a / b if b else float("nan")
+
+    out = {"pattern_by_class": [{"pattern": k, "n": cls[k][0],
+                                 "rate300": pct(cls[k][1], cls[k][0]),
+                                 "pen_pct": pct(cls[k][2], cls[k][0]),
+                                 "rate300_pen": pct(cls[k][3], cls[k][2]),
+                                 "pen_n": cls[k][2],
+                                 "alternation_pct": pct(alt[k][1], alt[k][0])}
+                                for k in PATTERN_CLASSES],
+           "pattern_by_sep": [{"band": name, "n": bands[name][0],
+                               "rate300": pct(bands[name][1], bands[name][0]),
+                               "abs_err": (bands[name][2] / bands[name][0]) if bands[name][0] else float("nan")}
+                              for _, _, name in SEP_BANDS]}
+    # where accuracy first falls away from the tightest separation played
+    usable = [r for r in out["pattern_by_sep"]
+              if r["n"] >= CEIL_MIN_TAPS and r["rate300"] == r["rate300"]]
+    knee = None
+    base = usable[0] if usable else None
+    if base:
+        for row in usable[1:]:
+            if row["rate300"] <= base["rate300"] - 5.0:
+                knee = row
+                break
+    out["pattern_sep_baseline"] = base["rate300"] if base else float("nan")
+    out["pattern_sep_baseline_band"] = base["band"] if base else None
+    out["pattern_sep_knee"] = knee["band"] if knee else None
+    out["pattern_sep_knee_rate"] = knee["rate300"] if knee else float("nan")
+    out["pattern_sep_knee_n"] = knee["n"] if knee else 0
+    out["pattern_sep_widest"] = usable[-1]["band"] if usable else None
+    out["pattern_sep_widest_rate"] = usable[-1]["rate300"] if usable else float("nan")
+    return out
 
 
 # ------------------------------------------------------------------ summary ---
@@ -783,6 +1403,22 @@ def to_summary(agg, cfg=None):
     sh = agg.get("speed_held_to_baseline")
     s["speed_held_to_baseline_bpm"] = ((sh["lo"] + sh["hi"]) / 2) if sh else None
     s["speed_plateau_rate300"] = agg.get("speed_plateau")
+    s["aim"] = {
+        "notes": agg.get("aim_notes"),
+        "notes_accepted": agg.get("aim_judged"),
+        "lost_to_aim": agg.get("aim_miss_offcircle"),
+        "lost_no_press": agg.get("aim_miss_nopress"),
+        "lost_to_aim_share": agg.get("aim_miss_offcircle_pct"),
+        "presses_thrown_away_for_position": agg.get("presses_offcircle"),
+        "presses_thrown_away_share": agg.get("presses_offcircle_pct"),
+        "presses_refused_by_note_lock": agg.get("presses_locked"),
+        "arrival_median_ms": agg.get("arrival_median_ms"),
+        "arrived_after_note_share": agg.get("arrived_late_pct"),
+        "no_movement_required": agg.get("aim_free_notes"),
+        "no_movement_required_share": agg.get("aim_free_pct"),
+        "rate300_still_travelling": agg.get("moving_rate300"),
+        "rate300_settled": agg.get("stationary_rate300"),
+    }
     s["tool"] = {"name": "osu-replay-report", "version": "1.0",
                  "ceil_300": cfg.get("ceil_300", DEFAULT_CEIL_300),
                  "ceil_min_taps": cfg.get("ceil_min_taps", CEIL_MIN_TAPS)}
